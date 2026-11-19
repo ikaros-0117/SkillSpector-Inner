@@ -37,11 +37,10 @@ class TestModelMetadataProtocolAttributes:
         assert "SLOT_DEFAULTS" in annotations
 
     def test_existing_providers_satisfy_protocol(self) -> None:
-        from skillspector.providers.anthropic import AnthropicProvider
-        from skillspector.providers.nv_build import NvBuildProvider
         from skillspector.providers.openai import OpenAIProvider
+        from skillspector.providers.openai_compatible import OpenAICompatibleProvider
 
-        for provider_cls in (NvBuildProvider, OpenAIProvider, AnthropicProvider):
+        for provider_cls in (OpenAIProvider, OpenAICompatibleProvider):
             assert hasattr(provider_cls, "DEFAULT_MODEL")
             assert isinstance(provider_cls.DEFAULT_MODEL, str)
             assert hasattr(provider_cls, "SLOT_DEFAULTS")

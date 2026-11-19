@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Ollama, Azure OpenAI, and generic OpenAI-compatible providers."""
+"""Tests for the OpenAI-compatible provider."""
 
 from __future__ import annotations
 
@@ -23,16 +23,13 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_openai import ChatOpenAI
 
 from skillspector.providers import (
-    create_chat_model,
     get_metadata_provider,
     registry,
     resolve_provider_credentials,
 )
-from skillspector.providers.azure_openai import AzureOpenAIProvider
-from skillspector.providers.ollama import OLLAMA_DEFAULT_BASE_URL, OllamaProvider
 from skillspector.providers.openai_compatible import OpenAICompatibleProvider
 
 
@@ -40,227 +37,21 @@ from skillspector.providers.openai_compatible import OpenAICompatibleProvider
 def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     """Isolate provider-related env vars and the YAML cache for each test."""
     for key in (
-        "NVIDIA_INFERENCE_KEY",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
-        "ANTHROPIC_API_KEY",
         "SKILLSPECTOR_MODEL",
         "SKILLSPECTOR_MODEL_REGISTRY",
         "SKILLSPECTOR_PROVIDER",
-        "OLLAMA_BASE_URL",
-        "AZURE_OPENAI_API_KEY",
-        "AZURE_OPENAI_ENDPOINT",
-        "AZURE_OPENAI_DEPLOYMENT",
-        "AZURE_OPENAI_API_VERSION",
         "SKILLSPECTOR_COMPAT_API_KEY",
         "SKILLSPECTOR_COMPAT_BASE_URL",
         "SKILLSPECTOR_COMPAT_HEADERS",
         "SKILLSPECTOR_TEMPERATURE",
         "SKILLSPECTOR_SEED",
-        "GOOGLE_CLOUD_PROJECT",
-        "GOOGLE_CLOUD_LOCATION",
-        "GOOGLE_APPLICATION_CREDENTIALS",
     ):
         monkeypatch.delenv(key, raising=False)
     registry._load.cache_clear()
     yield
     registry._load.cache_clear()
-
-
-# ── Ollama ──────────────────────────────────────────────────────────────────
-
-
-class TestOllamaProvider:
-    """Ollama provider — local/self-hosted LLM endpoint."""
-
-    def test_always_returns_credentials(self) -> None:
-        creds = OllamaProvider().resolve_credentials()
-        assert creds is not None
-        api_key, base_url = creds
-        assert api_key == "ollama"
-        assert base_url == OLLAMA_DEFAULT_BASE_URL
-
-    def test_custom_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("OLLAMA_BASE_URL", "http://gpu-server:11434/v1")
-        creds = OllamaProvider().resolve_credentials()
-        assert creds == ("ollama", "http://gpu-server:11434/v1")
-
-    def test_creates_chat_openai(self) -> None:
-        llm = OllamaProvider().create_chat_model("llama3.1:8b", max_tokens=512)
-        assert isinstance(llm, ChatOpenAI)
-        assert llm.model_name == "llama3.1:8b"
-        assert llm.max_tokens == 512
-        assert str(llm.openai_api_base).rstrip("/") == OLLAMA_DEFAULT_BASE_URL.rstrip("/")
-
-    def test_default_model(self) -> None:
-        assert OllamaProvider().resolve_model() == "llama3.1:8b"
-
-    def test_metadata_known_model(self) -> None:
-        provider = OllamaProvider()
-        assert provider.get_context_length("llama3.1:8b") == 131072
-        assert provider.get_max_output_tokens("llama3.1:8b") == 4096
-
-    def test_metadata_unknown_model_returns_none(self) -> None:
-        provider = OllamaProvider()
-        assert provider.get_context_length("unknown-model") is None
-
-    def test_env_model_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_MODEL", "mistral:7b")
-        assert OllamaProvider().resolve_model() == "mistral:7b"
-
-
-class TestOllamaProviderSelection:
-    """SKILLSPECTOR_PROVIDER=ollama selects the Ollama provider."""
-
-    def test_select_ollama(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "ollama")
-        assert isinstance(get_metadata_provider(), OllamaProvider)
-
-    def test_ollama_credentials_via_selector(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "ollama")
-        creds = resolve_provider_credentials()
-        assert creds is not None
-        assert creds[0] == "ollama"
-
-    def test_create_chat_model_with_ollama(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "ollama")
-        llm = create_chat_model("llama3.1:8b", max_tokens=512)
-        assert isinstance(llm, ChatOpenAI)
-
-
-# ── Azure OpenAI ────────────────────────────────────────────────────────────
-
-
-class TestAzureOpenAIProvider:
-    """Azure OpenAI provider — enterprise Azure deployments."""
-
-    def test_returns_none_without_env_vars(self) -> None:
-        assert AzureOpenAIProvider().resolve_credentials() is None
-
-    def test_returns_none_with_key_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
-        assert AzureOpenAIProvider().resolve_credentials() is None
-
-    def test_returns_none_with_endpoint_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://myorg.openai.azure.com/")
-        assert AzureOpenAIProvider().resolve_credentials() is None
-
-    def test_resolves_with_both_env_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
-        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://myorg.openai.azure.com/")
-        creds = AzureOpenAIProvider().resolve_credentials()
-        assert creds == ("azure-key", "https://myorg.openai.azure.com/")
-
-    def test_creates_azure_chat_openai(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
-        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://myorg.openai.azure.com/")
-        monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "my-gpt4o")
-        llm = AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1024)
-        assert isinstance(llm, AzureChatOpenAI)
-        assert llm.deployment_name == "my-gpt4o"
-
-    def test_deployment_defaults_to_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
-        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://myorg.openai.azure.com/")
-        llm = AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1024)
-        assert isinstance(llm, AzureChatOpenAI)
-        assert llm.deployment_name == "gpt-4o"
-
-    def test_api_version_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
-        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://myorg.openai.azure.com/")
-        llm = AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1024)
-        assert isinstance(llm, AzureChatOpenAI)
-        assert llm.openai_api_version == "2024-06-01"
-
-    def test_custom_api_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
-        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://myorg.openai.azure.com/")
-        monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "2025-01-01")
-        llm = AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1024)
-        assert isinstance(llm, AzureChatOpenAI)
-        assert llm.openai_api_version == "2025-01-01"
-
-    def test_sampling_controls_are_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        captured: dict[str, object] = {}
-
-        def fake_azure_chat_openai(**kwargs: object) -> dict[str, object]:
-            captured.update(kwargs)
-            return kwargs
-
-        monkeypatch.setattr(
-            "skillspector.providers.azure_openai.provider.AzureChatOpenAI",
-            fake_azure_chat_openai,
-        )
-        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
-        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://myorg.openai.azure.com/")
-        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
-        monkeypatch.setenv("SKILLSPECTOR_SEED", "7")
-
-        AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1024)
-
-        assert captured["temperature"] == 0.2
-        assert captured["seed"] == 7
-
-    def test_default_model(self) -> None:
-        assert AzureOpenAIProvider().resolve_model() == "gpt-4o"
-
-    def test_metadata_known_model(self) -> None:
-        provider = AzureOpenAIProvider()
-        assert provider.get_context_length("gpt-4o") == 128000
-        assert provider.get_max_output_tokens("gpt-4o") == 16384
-
-    def test_metadata_flagship_generation(self) -> None:
-        provider = AzureOpenAIProvider()
-        for model in (
-            "gpt-5.4",
-            "gpt-5.5",
-            "gpt-5.6-luna",
-            "gpt-5.6-terra",
-            "gpt-5.6-sol",
-            "gpt-5.6",
-            "gpt-6-astra",
-            "gpt-6-sol",
-            "gpt-6-luna",
-            "gpt-6.1-sol",
-        ):
-            assert provider.get_context_length(model) == 1050000
-            assert provider.get_max_output_tokens(model) == 128000
-
-    def test_metadata_gpt5_generation(self) -> None:
-        provider = AzureOpenAIProvider()
-        for model in (
-            "gpt-5",
-            "gpt-5-mini",
-            "gpt-5-nano",
-            "gpt-5.1",
-            "gpt-5.1-codex",
-            "gpt-5.1-codex-max",
-            "gpt-5.2",
-        ):
-            assert provider.get_context_length(model) == 400000
-            assert provider.get_max_output_tokens(model) == 128000
-
-    def test_create_returns_none_without_credentials(self) -> None:
-        assert AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1024) is None
-
-
-class TestAzureOpenAIProviderSelection:
-    """SKILLSPECTOR_PROVIDER=azure_openai selects the Azure provider."""
-
-    def test_select_azure_openai(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "azure_openai")
-        assert isinstance(get_metadata_provider(), AzureOpenAIProvider)
-
-    def test_azure_credentials_via_selector(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "azure_openai")
-        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
-        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://myorg.openai.azure.com/")
-        creds = resolve_provider_credentials()
-        assert creds == ("azure-key", "https://myorg.openai.azure.com/")
-
-
-# ── Generic OpenAI-Compatible ───────────────────────────────────────────────
 
 
 class TestOpenAICompatibleProvider:
@@ -476,12 +267,9 @@ class TestOpenAICompatibleProviderSelection:
 
 
 class TestUnknownProviderError:
-    """Verify the error message lists all providers including new ones."""
-
-    def test_error_message_includes_new_providers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_error_message_lists_supported_providers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "nonexistent")
-        with pytest.raises(ValueError, match="ollama") as exc_info:
+        with pytest.raises(
+            ValueError, match=r"Expected one of: openai, openai_compatible \(or unset\)"
+        ):
             get_metadata_provider()
-        error_msg = str(exc_info.value)
-        assert "azure_openai" in error_msg
-        assert "openai_compatible" in error_msg

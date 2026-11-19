@@ -456,22 +456,9 @@ def test_cli_scan_help_lists_every_available_provider() -> None:
     result = runner.invoke(app, ["scan", "--help"])
 
     assert result.exit_code == 0
-    for provider in (
-        "openai",
-        "anthropic",
-        "anthropic_proxy",
-        "bedrock",
-        "nv_build",
-        "nv_inference",
-        "ollama",
-        "azure_openai",
-        "openai_compatible",
-        "gemini",
-        "claude_cli",
-        "codex_cli",
-        "gemini_cli",
-    ):
-        assert provider in result.output
+    assert "openai (default) | openai_compatible" in result.output
+    assert "OPENAI_API_KEY" in result.output
+    assert "SKILLSPECTOR_COMPAT_API_KEY" in result.output
 
 
 @pytest.mark.parametrize(("no_llm", "expected"), [(False, True), (True, False)])
@@ -485,8 +472,8 @@ def test_scan_state_records_explicit_llm_request_intent(no_llm: bool, expected: 
 def test_cli_help_does_not_initialize_analyzers() -> None:
     """Help should not compile the scan graph or warn about missing credentials."""
     env = os.environ.copy()
-    env["SKILLSPECTOR_PROVIDER"] = "nv_build"
-    for name in ("ANTHROPIC_API_KEY", "NVIDIA_INFERENCE_KEY", "OPENAI_API_KEY"):
+    env["SKILLSPECTOR_PROVIDER"] = "openai"
+    for name in ("OPENAI_API_KEY", "SKILLSPECTOR_COMPAT_API_KEY"):
         env.pop(name, None)
 
     completed = subprocess.run(

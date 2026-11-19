@@ -41,7 +41,6 @@ from random import uniform
 from typing import Any, Literal, cast, get_args
 
 import tiktoken
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import BaseMessage
 from langchain_openai.chat_models.base import BaseChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -64,9 +63,7 @@ from skillspector.inspection_ledger import (
     outcome_for_llm_batch_failure,
 )
 from skillspector.llm_utils import (
-    AgentCLIChatModel,
     StructuredOutputParseError,
-    _AgentCLIMessage,
     _ainvoke_with_usage,
     _invoke_with_usage,
     bind_structured_output,
@@ -75,14 +72,10 @@ from skillspector.llm_utils import (
     get_chat_model,
     is_structured_output_rejection,
     new_inference_usage_collector,
-    structured_output_instructions,
 )
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
-from skillspector.providers import UnknownProviderError, get_active_provider, has_cli_capability
-from skillspector.providers._agent_cli import MAX_INPUT_BYTES
-from skillspector.providers.gemini import GeminiProvider
 from skillspector.response_recovery import (
     parse_recovery_value,
     recover_payload,
@@ -99,9 +92,6 @@ from skillspector.structured_response import (
 logger = get_logger(__name__)
 
 DEFAULT_MAX_LLM_CONCURRENCY = 10
-# A CLI-provider call is a whole agent session on the user's own plan, so the
-# default fan-out is much smaller than for an HTTP API.
-DEFAULT_CLI_MAX_LLM_CONCURRENCY = 2
 API_CONNECTION_MAX_RETRIES = 3
 API_CONNECTION_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 RATE_LIMIT_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0)
@@ -278,44 +268,21 @@ _RETRYABLE_PROVIDER_ERROR_NAMES = frozenset(
         "ConnectionError",
         "ConnectError",
         "ConnectTimeout",
-        "ConnectTimeoutError",
-        "EndpointConnectionError",
         "HTTPClientError",
         "InternalServerError",
-        "ModelNotReadyException",
         "PoolTimeout",
-        "ProxyConnectionError",
         "RateLimitError",
         "ReadTimeout",
-        "ReadTimeoutError",
         "RemoteProtocolError",
         "ResponseStreamingError",
         "ServiceUnavailableError",
         "SSLError",
-        "ThrottlingException",
         "WriteTimeout",
     }
 )
 _RETRYABLE_PROVIDER_STATUS_CODES = frozenset({408, 409, 425, 429})
 _NATIVE_RETRYABLE_PROVIDER_ERROR_NAMES = frozenset({"APIConnectionError", "APITimeoutError"})
 _NATIVE_RETRYABLE_PROVIDER_STATUS_CODES = frozenset({408, 409, 429})
-_RETRYABLE_BEDROCK_ERROR_CODES = frozenset(
-    {
-        "ec2throttledexception",
-        "internalserverexception",
-        "modelnotreadyexception",
-        "priorrequestnotcomplete",
-        "requestlimitexceeded",
-        "requesttimeout",
-        "requesttimeoutexception",
-        "servicetemporarilyunavailable",
-        "serviceunavailableexception",
-        "slowdown",
-        "throttling",
-        "throttlingexception",
-        "toomanyrequestsexception",
-    }
-)
 
 
 def _exception_chain(exc: BaseException) -> list[BaseException]:
@@ -331,44 +298,18 @@ def _exception_chain(exc: BaseException) -> list[BaseException]:
 
 
 def _provider_status_code(exc: BaseException) -> int | None:
-    """Read an HTTP status from OpenAI, Anthropic, httpx, or botocore shapes."""
+    """Read an HTTP status from the exception or its HTTP response."""
     response = getattr(exc, "response", None)
-    candidates: list[object] = [getattr(exc, "status_code", None)]
-    if isinstance(response, Mapping):
-        metadata = response.get("ResponseMetadata")
-        if isinstance(metadata, Mapping):
-            candidates.append(metadata.get("HTTPStatusCode"))
-    elif response is not None:
-        candidates.append(getattr(response, "status_code", None))
-    for value in candidates:
+    for value in (getattr(exc, "status_code", None), getattr(response, "status_code", None)):
         if isinstance(value, int) and not isinstance(value, bool):
             return value
     return None
 
 
-def _bedrock_error_code(exc: BaseException) -> str | None:
-    """Read the stable AWS error code from a botocore ClientError-like object."""
-    response = getattr(exc, "response", None)
-    if not isinstance(response, Mapping):
-        return None
-    error = response.get("Error")
-    if not isinstance(error, Mapping):
-        return None
-    code = error.get("Code")
-    return str(code).strip().lower() if code else None
-
-
 def _provider_headers(exc: BaseException) -> list[Mapping[object, object]]:
-    """Return response-header mappings without assuming one provider SDK."""
+    """Return the exception and HTTP response header mappings."""
     response = getattr(exc, "response", None)
-    sources: list[object] = [getattr(exc, "headers", None)]
-    if isinstance(response, Mapping):
-        metadata = response.get("ResponseMetadata")
-        if isinstance(metadata, Mapping):
-            sources.append(metadata.get("HTTPHeaders"))
-        sources.append(response.get("headers"))
-    elif response is not None:
-        sources.append(getattr(response, "headers", None))
+    sources = (getattr(exc, "headers", None), getattr(response, "headers", None))
     return [source for source in sources if isinstance(source, Mapping)]
 
 
@@ -396,8 +337,6 @@ def _transient_provider_cause(exc: BaseException) -> BaseException | None:
             status_code is not None and 500 <= status_code <= 599
         ):
             return candidate
-        if _bedrock_error_code(candidate) in _RETRYABLE_BEDROCK_ERROR_CODES:
-            return candidate
     return None
 
 
@@ -411,9 +350,9 @@ def _is_retryable_provider_error(exc: BaseException) -> bool:
 
 
 def _native_retries_cover_provider_error(exc: BaseException) -> bool:
-    """Return whether the configured OpenAI/Anthropic SDK retries this failure.
+    """Return whether the OpenAI SDK retries this failure.
 
-    Their locked SDK versions cover connection failures, 408/409/429, and 5xx,
+    The locked SDK version covers connection failures, 408/409/429, and 5xx,
     but not 425. Keeping this narrower than the coordinator policy prevents a
     retryable status that the SDK does not own from being dropped after one call.
     """
@@ -544,23 +483,13 @@ def _safe_failed_request_diagnostic(
 
 def _is_rate_limit_provider_error(exc: BaseException) -> bool:
     """Return whether a retryable provider failure represents quota throttling."""
-    rate_limit_codes = {
-        "ec2throttledexception",
-        "requestlimitexceeded",
-        "slowdown",
-        "throttling",
-        "throttlingexception",
-        "toomanyrequestsexception",
-    }
     for candidate in _exception_chain(exc):
         override = _provider_retry_override(candidate)
         if override is False:
             return False
-        if type(candidate).__name__ in {"RateLimitError", "ThrottlingException"}:
+        if type(candidate).__name__ == "RateLimitError":
             return True
         if _provider_status_code(candidate) == 429:
-            return True
-        if _bedrock_error_code(candidate) in rate_limit_codes:
             return True
     return False
 
@@ -580,22 +509,21 @@ def _provider_retry_after_seconds(exc: BaseException) -> float | None:
                     if delay >= 0:
                         return min(delay, PROVIDER_RETRY_AFTER_MAX_SECONDS)
 
-            for header in ("retry-after", "x-amz-retry-after"):
-                raw_delay = headers.get(header)
-                if raw_delay is None:
-                    continue
+            raw_delay = headers.get("retry-after")
+            if raw_delay is None:
+                continue
+            try:
+                delay = float(str(raw_delay))
+            except (TypeError, ValueError):
                 try:
-                    delay = float(str(raw_delay))
-                except (TypeError, ValueError):
-                    try:
-                        retry_at = parsedate_to_datetime(str(raw_delay))
-                    except (TypeError, ValueError, OverflowError):
-                        continue
-                    if retry_at.tzinfo is None:
-                        continue
-                    delay = max(0.0, retry_at.timestamp() - time.time())
-                if delay >= 0:
-                    return min(delay, PROVIDER_RETRY_AFTER_MAX_SECONDS)
+                    retry_at = parsedate_to_datetime(str(raw_delay))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if retry_at.tzinfo is None:
+                    continue
+                delay = max(0.0, retry_at.timestamp() - time.time())
+            if delay >= 0:
+                return min(delay, PROVIDER_RETRY_AFTER_MAX_SECONDS)
     return None
 
 
@@ -625,9 +553,6 @@ def _uses_native_connection_retries(
             if client is not None:
                 client.max_retries = max_retries
         return max_retries > 0
-    if isinstance(chat_model, ChatAnthropic):
-        chat_model.max_retries = max_retries
-        return max_retries > 0
     return False
 
 
@@ -644,16 +569,6 @@ def _retarget_request_timeout(chat_model: object, timeout: float | None) -> bool
         for client in clients:
             client.timeout = timeout
         chat_model.request_timeout = timeout
-        return True
-    if isinstance(chat_model, ChatAnthropic):
-        # ``timeout <= 0`` is how ChatAnthropic spells "leave the SDK default alone"; an
-        # expired deadline never reaches here because ``_require_time_remaining`` raises first.
-        for client in (chat_model._client, chat_model._async_client):
-            client.timeout = timeout
-        chat_model.default_request_timeout = timeout
-        return True
-    if isinstance(chat_model, AgentCLIChatModel):
-        chat_model.set_timeout(timeout)
         return True
     return False
 
@@ -776,28 +691,10 @@ def _shared_limiter(limit: int) -> _GlobalLLMLimiter:
         return limiter
 
 
-def _default_max_concurrency() -> int:
-    """Return the fan-out default for the active provider.
-
-    CLI providers get :data:`DEFAULT_CLI_MAX_LLM_CONCURRENCY` because every
-    request starts a separate agent session that counts against the user's
-    plan. An unknown provider keeps the HTTP default; provider selection
-    reports that error itself.
-    """
-    try:
-        provider = get_active_provider()
-    except UnknownProviderError:
-        return DEFAULT_MAX_LLM_CONCURRENCY
-    if has_cli_capability(provider):
-        return DEFAULT_CLI_MAX_LLM_CONCURRENCY
-    return DEFAULT_MAX_LLM_CONCURRENCY
-
-
 def resolve_max_concurrency() -> int:
     """Resolve the LLM fan-out concurrency from ``SKILLSPECTOR_MAX_LLM_CONCURRENCY``.
 
-    Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`, or to
-    :data:`DEFAULT_CLI_MAX_LLM_CONCURRENCY` for CLI providers. Users on rate-limited
+    Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`. Users on rate-limited
     providers (free tiers with a low RPM) can set it to ``1`` to serialize
     requests across every analyzer instead of bursting up to 10 in parallel — a burst that otherwise
     guarantees 429s, and 429'd batches are dropped from the result (see the
@@ -806,11 +703,11 @@ def resolve_max_concurrency() -> int:
     """
     raw = os.environ.get("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "").strip()
     if not raw:
-        return _default_max_concurrency()
+        return DEFAULT_MAX_LLM_CONCURRENCY
     try:
         value = int(raw)
     except ValueError:
-        default = _default_max_concurrency()
+        default = DEFAULT_MAX_LLM_CONCURRENCY
         logger.warning(
             "Invalid SKILLSPECTOR_MAX_LLM_CONCURRENCY=%r (not an int); using %d",
             raw,
@@ -826,24 +723,6 @@ def resolve_max_concurrency() -> int:
 # OpenAI suggests ~4 chars per token for English text with BPE tokenizers.
 CHARS_PER_TOKEN = 4
 CHUNK_OVERLAP_LINES = 50
-# Headroom kept below a CLI provider's input cap after the fixed prompt is measured.
-PROMPT_BYTE_SAFETY_MARGIN = 4_096
-
-
-def _cli_max_input_bytes() -> int | None:
-    """Return the prompt byte cap of the active provider, or ``None`` when it has none.
-
-    CLI providers pass the prompt through :func:`run_agent_cli`, which rejects
-    anything over ``MAX_INPUT_BYTES`` before the CLI starts.  HTTP providers have
-    no such cap here; an unknown provider is reported by provider selection itself.
-    """
-    try:
-        provider = get_active_provider()
-    except UnknownProviderError:
-        return None
-    if has_cli_capability(provider):
-        return MAX_INPUT_BYTES
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1402,8 +1281,7 @@ def chunk_file_by_lines(
     serialized size, rather than rounding each line independently.
 
     When *max_bytes* is set, each chunk must also fit within that many UTF-8
-    bytes *after* :func:`number_lines` has prefixed it, which is what a CLI
-    provider's input cap measures.  A single line that alone exceeds the budget
+    bytes *after* :func:`number_lines` has prefixed it. A single line that exceeds the budget
     still becomes its own chunk: content is never dropped or truncated. The
     invocation guard records an explicit failure instead of submitting it.
     """
@@ -1494,13 +1372,6 @@ def _message_text(response: object) -> str:
     if not isinstance(response, BaseMessage):
         raise TypeError(f"Expected BaseMessage from chat model, got {type(response).__name__}")
     return str(response.text)
-
-
-def _raw_response_text(response: object) -> str:
-    """Extract raw analyzer text from LangChain and CLI adapter messages."""
-    if isinstance(response, _AgentCLIMessage):
-        return str(response.content)
-    return _message_text(response)
 
 
 BASE_ANALYSIS_PROMPT = """\
@@ -1657,16 +1528,7 @@ class LLMAnalyzerBase:
         remaining = self._require_time_remaining()
         if not self._dynamic_timeout:
             return self._llm, self._structured_llm
-        provider = get_active_provider()
-        token_changed = False
-        if isinstance(provider, GeminiProvider) and isinstance(self._llm, BaseChatOpenAI):
-            credentials = provider.resolve_credentials(timeout=remaining)
-            if credentials is None:
-                raise ValueError("Gemini credentials unavailable.")
-            token = self._llm.openai_api_key
-            token_changed = token is None or token.get_secret_value() != credentials[0]
-            remaining = self._require_time_remaining()
-        if not token_changed and _retarget_request_timeout(self._llm, remaining):
+        if _retarget_request_timeout(self._llm, remaining):
             # Native retries were already disabled for the dynamic-deadline case in
             # ``__init__``, and the structured runnable wraps this same model instance.
             return self._llm, self._structured_llm
@@ -1691,8 +1553,6 @@ class LLMAnalyzerBase:
             if self.response_schema
             else None
         )
-        if token_changed:
-            self._llm, self._structured_llm = llm, structured
         return llm, structured
 
     @property
@@ -1724,14 +1584,11 @@ class LLMAnalyzerBase:
         """Create one :class:`Batch` per file, splitting oversized files into chunks.
 
         Every batch accounts for the real prompt wrapper, findings and schema
-        as well as line prefixes. For CLI providers it must also stay under the
-        provider's byte cap (see :func:`_cli_max_input_bytes`).  The fixed part of
-        the prompt is measured with :meth:`build_prompt` itself, called with
+        as well as line prefixes. The fixed part of the prompt is measured
+        with :meth:`build_prompt` itself, called with
         *prompt_kwargs* (the same keyword arguments later passed to the run), so
         subclass prompt layouts are accounted for rather than estimated.
         """
-        max_input_bytes = _cli_max_input_bytes()
-
         findings_by_file: dict[str, list[Finding]] = defaultdict(list)
         if findings:
             for f in findings:
@@ -1755,29 +1612,16 @@ class LLMAnalyzerBase:
                 retained = Batch(file_path=path, content=content, findings=file_findings)
                 batches.append(retained)
                 logger.warning("Fixed LLM prompt cannot fit input budget; batch content retained")
-                if max_input_bytes is not None and fixed_bytes > max_input_bytes:
-                    logger.warning(
-                        "LLM prompt exceeds the provider input limit; batch content retained"
-                    )
                 continue
             fixed_tokens = (fixed_bytes + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
             content_budget = max(self._input_budget - fixed_tokens, 1)
-            byte_budget: int | None = None
-            if max_input_bytes is not None:
-                byte_budget = max_input_bytes - fixed_bytes - PROMPT_BYTE_SAFETY_MARGIN
 
-            first_batch = len(batches)
             content_tokens = (
                 _numbered_size_bound(content, last_line) + CHARS_PER_TOKEN - 1
             ) // CHARS_PER_TOKEN
-            fits_bytes = byte_budget is None or (
-                _numbered_size_bound(content, last_line) <= byte_budget
-            )
             whole = Batch(file_path=path, content=content, findings=file_findings)
-            if (
-                content_tokens <= content_budget
-                and fits_bytes
-                and self._prompt_fits_budget(self.build_prompt(whole, **prompt_kwargs))
+            if content_tokens <= content_budget and self._prompt_fits_budget(
+                self.build_prompt(whole, **prompt_kwargs)
             ):
                 batches.append(
                     Batch(
@@ -1787,11 +1631,6 @@ class LLMAnalyzerBase:
                     )
                 )
             else:
-                chunk_budget = content_budget
-                # A non-positive byte budget means the fixed prompt alone is over the
-                # cap; splitting the content further cannot help, and every batch is
-                # reported below and fails closed at the provider.
-                chunk_bytes = byte_budget if byte_budget is not None and byte_budget > 0 else None
 
                 def fits_chunk(
                     text: str,
@@ -1816,8 +1655,7 @@ class LLMAnalyzerBase:
 
                 for chunk_text, s_line, e_line in chunk_file_by_lines(
                     content,
-                    chunk_budget,
-                    max_bytes=chunk_bytes,
+                    content_budget,
                     fits_chunk=fits_chunk,
                 ):
                     chunk_findings = findings_in_range(file_findings, s_line, e_line)
@@ -1834,18 +1672,6 @@ class LLMAnalyzerBase:
                         batches.extend(self._fragment_source_line(batch, **prompt_kwargs))
                     else:
                         batches.append(batch)
-
-            if max_input_bytes is not None:
-                for batch in batches[first_batch:]:
-                    size = fixed_bytes + _numbered_size_bound(batch.content, last_line)
-                    if size > max_input_bytes:
-                        logger.warning(
-                            "LLM prompt for %s exceeds the provider input limit "
-                            "(%d > %d bytes); the batch will fail closed",
-                            batch.file_label,
-                            size,
-                            max_input_bytes,
-                        )
 
         return batches
 
@@ -1904,8 +1730,7 @@ class LLMAnalyzerBase:
     ) -> int:
         """Bytes the prompt for *path* takes around empty content.
 
-        Includes the structured-output instructions a CLI transport appends
-        after :meth:`build_prompt`.  The probe uses the widest possible label
+        Includes the structured-output schema. The probe uses the widest possible label
         (``lines last_line–last_line``) and all of the file's findings, so it
         bounds the fixed part of every batch for *path*.
         """
@@ -1916,10 +1741,11 @@ class LLMAnalyzerBase:
             end_line=last_line,
             findings=findings,
         )
-        prompt = self.build_prompt(probe, **prompt_kwargs)
-        if self.response_schema is not None:
-            prompt += structured_output_instructions(self.response_schema)
-        return len(prompt.encode("utf-8", errors="replace"))
+        return len(
+            self._serialized_input(self.build_prompt(probe, **prompt_kwargs)).encode(
+                "utf-8", errors="replace"
+            )
+        )
 
     # -- Prompt / parse -----------------------------------------------------
 
@@ -1962,7 +1788,8 @@ class LLMAnalyzerBase:
 
     def _serialized_input(self, prompt: str) -> str:
         if self.response_schema is not None:
-            return prompt + structured_output_instructions(self.response_schema)
+            schema = json.dumps(self.response_schema.model_json_schema(), indent=2)
+            return f"{prompt}\n\n{schema}"
         return prompt
 
     def _count_prompt_tokens(self, prompt: str, *, chat_model: object | None = None) -> int:
@@ -1990,12 +1817,9 @@ class LLMAnalyzerBase:
 
     def _check_prompt_budget(self, prompt: str, *, chat_model: object | None = None) -> None:
         """Reject an unfit serialized batch before it reaches a provider."""
-        size = len(self._serialized_input(prompt).encode("utf-8", errors="replace"))
-        count = self._count_prompt_tokens(prompt, chat_model=chat_model)
-        byte_cap = _cli_max_input_bytes()
-        if count > self._input_budget or (byte_cap is not None and size > byte_cap):
+        if self._count_prompt_tokens(prompt, chat_model=chat_model) > self._input_budget:
             raise LLMInputBudgetError(
-                "serialized LLM input exceeds its token or byte budget; "
+                "serialized LLM input exceeds its token budget; "
                 "batch content retained but not submitted"
             )
 
@@ -2098,7 +1922,7 @@ class LLMAnalyzerBase:
                         ) from retry_exc
                     raise
         else:
-            response = _raw_response_text(self._invoke_with_failure_diagnostic(llm, prompt))
+            response = _message_text(self._invoke_with_failure_diagnostic(llm, prompt))
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
@@ -2416,13 +2240,10 @@ class LLMAnalyzerBase:
         items: list[BaseModel] = []
         plan = self._field_recovery_plan(batch, prompt, source, items)
         answer = None
-        process_completion_only = isinstance(self._llm, AgentCLIChatModel)
         while True:
             try:
                 question = plan.send(answer)
             except StopIteration as done:
-                if process_completion_only:
-                    return self._recovered_result(batch, items, False)
                 return done.value
             except Exception as exc:
                 plan.close()
@@ -2433,10 +2254,6 @@ class LLMAnalyzerBase:
                 # complete prompt against the actual refreshed request client too.
                 self._check_prompt_budget(question.prompt, chat_model=llm)
                 response = self._invoke_with_failure_diagnostic(llm, question.prompt)
-                if (getattr(response, "response_metadata", {}) or {}).get(
-                    "completion_source"
-                ) == "cli_process":
-                    process_completion_only = True
                 answer = self._recovery_answer(response, question)
             except Exception as exc:
                 plan.close()
@@ -2446,13 +2263,10 @@ class LLMAnalyzerBase:
         items: list[BaseModel] = []
         plan = self._field_recovery_plan(batch, prompt, source, items)
         answer = None
-        process_completion_only = isinstance(self._llm, AgentCLIChatModel)
         while True:
             try:
                 question = plan.send(answer)
             except StopIteration as done:
-                if process_completion_only:
-                    return self._recovered_result(batch, items, False)
                 return done.value
             except Exception as exc:
                 plan.close()
@@ -2463,10 +2277,6 @@ class LLMAnalyzerBase:
                 # token/byte limits without dropping already recovered findings.
                 self._check_prompt_budget(question.prompt, chat_model=llm)
                 response = await self._ainvoke_with_failure_diagnostic(llm, question.prompt)
-                if (getattr(response, "response_metadata", {}) or {}).get(
-                    "completion_source"
-                ) == "cli_process":
-                    process_completion_only = True
                 answer = self._recovery_answer(response, question)
             except Exception as exc:
                 plan.close()
@@ -2689,7 +2499,7 @@ class LLMAnalyzerBase:
                         ) from retry_exc
                     raise
         else:
-            response = _raw_response_text(await self._ainvoke_with_failure_diagnostic(llm, prompt))
+            response = _message_text(await self._ainvoke_with_failure_diagnostic(llm, prompt))
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
@@ -2894,20 +2704,17 @@ class LLMAnalyzerBase:
         explicit argument still wins.
 
         Failures are isolated per batch: transient provider failures (including
-        connection and timeout errors, 408/409/425/429 and 5xx responses, and
-        Bedrock throttling/service errors) receive three bounded retries when
+        connection and timeout errors, 408/409/425/429 and 5xx responses)
+        receive three bounded retries when
         the chat model has no native retry support. Backoff is 500ms, 1s, and
         2s for transport and service failures, or 5s, 15s, and 30s for rate
         limits, unless a bounded provider ``Retry-After`` hint asks for longer.
-        OpenAI and Anthropic chat models use their native three-retry policy
-        instead when the timeout is static. Bedrock SDK retries are disabled so
-        the same coordinator budget handles its failures without a second
-        retry layer. A dynamic workflow deadline disables configurable native
+        OpenAI chat models use their native three-retry policy when the timeout
+        is static. A dynamic workflow deadline disables configurable native
         retries so each coordinator retry can re-check and cap its delay
         against remaining time.
         Unrecovered errors cost only their own batch and are omitted from the result.
-        Malformed structured responses (Pydantic ``ValidationError``, CLI
-        JSON parse failures, or no structured result at all) receive three
+        Malformed or missing structured responses receive three
         bounded exponential-backoff retries
         before attempting bounded field-by-field recovery for a completed answer.
         The original retry phase makes at most seven outer invocations. Recovery

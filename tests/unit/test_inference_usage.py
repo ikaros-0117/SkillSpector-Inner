@@ -38,7 +38,7 @@ def test_collector_captures_standardized_langchain_usage_without_double_counting
     collector = InferenceUsageCollector(
         node="semantic_security_discovery",
         request_kind="structured_output",
-        provider="anthropic",
+        provider="openai_compatible",
         requested_model="claude-opus-4-8",
     )
 
@@ -48,7 +48,7 @@ def test_collector_captures_standardized_langchain_usage_without_double_counting
         {
             "node": "semantic_security_discovery",
             "request_kind": "structured_output",
-            "provider": "anthropic",
+            "provider": "openai_compatible",
             "model": "claude-opus-4-8-20260801",
             "model_source": "provider_response",
             "usage_source": "provider_response",
@@ -66,7 +66,7 @@ def test_collector_marks_response_received_without_usage_counters() -> None:
     collector = InferenceUsageCollector(
         node="semantic_quality_policy",
         request_kind="structured_output",
-        provider="codex_cli",
+        provider="openai",
         requested_model="gpt-5.6-sol",
     )
     message = AIMessage(content="provider returned without usage metadata")
@@ -75,7 +75,7 @@ def test_collector_marks_response_received_without_usage_counters() -> None:
 
     assert collector.response_received is True
     observation = collector.snapshot()
-    assert observation[0]["provider"] == "codex_cli"
+    assert observation[0]["provider"] == "openai"
     assert observation[0]["usage_source"] == "provider_response"
     assert sanitize_inference_usage(observation) == []
 
@@ -112,13 +112,12 @@ def test_constructor_control_registry_drops_credential_shaped_effort(effort: str
     [
         ({"reasoning_effort": "high"}, {"reasoning_effort": "high"}),
         ({"reasoning": {"effort": "high"}}, {"reasoning_effort": "high"}),
-        ({"output_config": {"effort": "high"}}, {"reasoning_effort": "high"}),
         (
             {"reasoning_effort": None, "reasoning": {"effort": "high"}},
             {"reasoning_effort": None},
         ),
         (
-            {"reasoning": {"effort": None}, "output_config": {"effort": "high"}},
+            {"reasoning": {"effort": None}},
             {"reasoning_effort": None},
         ),
         ({"reasoning": "high"}, {"reasoning_effort": None}),
@@ -131,148 +130,6 @@ def test_retained_reasoning_effort_uses_provider_payload_fields(
     model = SimpleNamespace(_get_request_payload=lambda _prompt: payload)
 
     assert retained_chat_model_controls(model, ("reasoning_effort",)) == expected
-
-
-def test_raw_anthropic_usage_adds_external_cache_counters_to_prompt_total() -> None:
-    """Anthropic raw input_tokens excludes cache reads and cache creation."""
-    message = SimpleNamespace(
-        usage_metadata=None,
-        response_metadata={
-            "model": "claude-sonnet-4-6",
-            "usage": {
-                "input_tokens": 30,
-                "output_tokens": 7,
-                "cache_read_input_tokens": 50,
-                "cache_creation_input_tokens": 20,
-            },
-        },
-    )
-
-    record = _usage_record(
-        message,
-        {},
-        node="meta_analyzer",
-        request_kind="structured_output",
-        provider="anthropic",
-        requested_model="claude-sonnet-4-6",
-    )
-
-    assert record is not None
-    assert record["prompt_tokens"] == 100
-    assert record["completion_tokens"] == 7
-    assert record["cached_tokens"] == 50
-    assert record["cache_write_tokens"] == 20
-    assert record["total_tokens"] == 107
-
-
-def test_raw_anthropic_ttl_cache_writes_are_included_in_prompt_total() -> None:
-    """Raw TTL partitions are direct cache writes even without a generic total."""
-    message = SimpleNamespace(
-        usage_metadata=None,
-        response_metadata={
-            "model": "claude-sonnet-4-6",
-            "usage": {
-                "input_tokens": 85,
-                "output_tokens": 7,
-                "cache_creation": {
-                    "ephemeral_5m_input_tokens": 10,
-                    "ephemeral_1h_input_tokens": 5,
-                },
-            },
-        },
-    )
-
-    record = _usage_record(
-        message,
-        {},
-        node="meta_analyzer",
-        request_kind="structured_output",
-        provider="anthropic",
-        requested_model="claude-sonnet-4-6",
-    )
-
-    assert record is not None
-    assert record["prompt_tokens"] == 100
-    assert record["completion_tokens"] == 7
-    assert record["cache_write_tokens"] == 15
-    assert record["total_tokens"] == 107
-
-
-def test_standardized_prompt_wins_when_raw_anthropic_cache_usage_is_also_present() -> None:
-    """A LangChain AIMessage can carry both normalized and raw usage views."""
-    message = SimpleNamespace(
-        usage_metadata={
-            "input_tokens": 100,
-            "output_tokens": 7,
-            "total_tokens": 107,
-        },
-        response_metadata={
-            "model": "claude-sonnet-4-6",
-            "usage": {
-                "input_tokens": 30,
-                "output_tokens": 7,
-                "cache_read_input_tokens": 50,
-                "cache_creation_input_tokens": 20,
-            },
-        },
-    )
-
-    record = _usage_record(
-        message,
-        {},
-        node="meta_analyzer",
-        request_kind="structured_output",
-        provider="anthropic",
-        requested_model="claude-sonnet-4-6",
-    )
-
-    assert record is not None
-    assert record["prompt_tokens"] == 100
-    assert record["cached_tokens"] == 50
-    assert record["cache_write_tokens"] == 20
-    assert record["total_tokens"] == 107
-
-
-def test_anthropic_ttl_cache_creation_partitions_override_zero_generic_counter() -> None:
-    """LangChain exposes 5m/1h writes separately and zeros the generic field."""
-    message = SimpleNamespace(
-        usage_metadata={
-            "input_tokens": 100,
-            "output_tokens": 7,
-            "total_tokens": 107,
-            "input_token_details": {
-                "cache_creation": 0,
-                "ephemeral_5m_input_tokens": 10,
-                "ephemeral_1h_input_tokens": 5,
-            },
-        },
-        response_metadata={
-            "model": "claude-sonnet-4-6",
-            "usage": {
-                "input_tokens": 85,
-                "output_tokens": 7,
-                "cache_creation_input_tokens": 15,
-                "cache_creation": {
-                    "ephemeral_5m_input_tokens": 10,
-                    "ephemeral_1h_input_tokens": 5,
-                },
-            },
-        },
-    )
-
-    record = _usage_record(
-        message,
-        {},
-        node="meta_analyzer",
-        request_kind="structured_output",
-        provider="anthropic",
-        requested_model="claude-sonnet-4-6",
-    )
-
-    assert record is not None
-    assert record["prompt_tokens"] == 100
-    assert record["cache_write_tokens"] == 15
-    assert record["total_tokens"] == 107
 
 
 def test_openai_nested_cached_and_reasoning_counters_are_subsets() -> None:
@@ -306,7 +163,7 @@ def test_openai_nested_cached_and_reasoning_counters_are_subsets() -> None:
     assert record["total_tokens"] == 102
 
 
-def test_standardized_bedrock_total_is_recomputed_from_normalized_partitions() -> None:
+def test_standardized_total_is_recomputed_from_normalized_partitions() -> None:
     message = SimpleNamespace(
         usage_metadata={
             "input_tokens": 100,
@@ -324,7 +181,7 @@ def test_standardized_bedrock_total_is_recomputed_from_normalized_partitions() -
         {},
         node="meta_analyzer",
         request_kind="structured_output",
-        provider="bedrock",
+        provider="openai_compatible",
         requested_model="us.anthropic.claude-sonnet-4-6-20250915-v1:0",
     )
 
@@ -343,7 +200,7 @@ def test_no_provider_counters_produces_no_record() -> None:
             {},
             node="meta_analyzer",
             request_kind="structured_output",
-            provider="nv_inference",
+            provider="openai",
             requested_model="some-model",
         )
         is None
@@ -361,7 +218,7 @@ def test_requested_model_fallback_is_explicit_when_response_omits_model() -> Non
         {},
         node="semantic_quality_policy",
         request_kind="structured_output",
-        provider="nv_inference",
+        provider="openai",
         requested_model="azure/anthropic/claude-opus-4-6",
     )
 
@@ -401,7 +258,7 @@ def test_provider_model_url_with_userinfo_falls_back_to_requested_model() -> Non
         {},
         node="semantic_quality_policy",
         request_kind="structured_output",
-        provider="nv_inference",
+        provider="openai",
         requested_model="azure/anthropic/claude-opus-4-6",
     )
 
@@ -414,7 +271,7 @@ def test_report_sanitizer_rejects_url_and_userinfo_model_labels() -> None:
     common = {
         "node": "meta_analyzer",
         "request_kind": "structured_output",
-        "provider": "anthropic",
+        "provider": "openai_compatible",
         "model_source": "provider_response",
         "usage_source": "provider_response",
         "prompt_tokens": 11,
@@ -441,7 +298,7 @@ def test_report_sanitizer_whitelists_fields_and_rejects_invalid_values() -> None
             {
                 "node": "meta_analyzer",
                 "request_kind": "structured_output",
-                "provider": "anthropic",
+                "provider": "openai_compatible",
                 "model": "bad\nmodel",
                 "model_source": "requested_model",
                 "prompt_tokens": 11,
@@ -452,7 +309,7 @@ def test_report_sanitizer_whitelists_fields_and_rejects_invalid_values() -> None
             {
                 "node": "meta_analyzer",
                 "request_kind": "structured_output",
-                "provider": "anthropic",
+                "provider": "openai_compatible",
                 "model": "claude-sonnet-4-6",
                 "model_source": "provider_response",
                 "prompt_tokens": 11,
@@ -463,7 +320,7 @@ def test_report_sanitizer_whitelists_fields_and_rejects_invalid_values() -> None
             {
                 "node": "meta_analyzer",
                 "request_kind": "structured_output",
-                "provider": "anthropic",
+                "provider": "openai_compatible",
                 "model": "claude-sonnet-4-6",
                 "model_source": "provider_response",
                 "prompt_tokens": 1 << 63,
@@ -474,7 +331,7 @@ def test_report_sanitizer_whitelists_fields_and_rejects_invalid_values() -> None
         {
             "node": "meta_analyzer",
             "request_kind": "structured_output",
-            "provider": "anthropic",
+            "provider": "openai_compatible",
             "model": "claude-sonnet-4-6",
             "model_source": "provider_response",
             "usage_source": "provider_response",

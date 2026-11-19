@@ -21,7 +21,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai import ChatOpenAI
@@ -38,9 +37,6 @@ from skillspector.llm_utils import (
     unsupported_control_error,
 )
 from skillspector.providers import registry
-from skillspector.providers.anthropic import AnthropicProvider
-from skillspector.providers.anthropic_proxy import AnthropicProxyProvider
-from skillspector.providers.azure_openai import AzureOpenAIProvider
 from skillspector.providers.chat_models import (
     GPT_6_1_SOL_REASONING_EFFORTS,
     UnsupportedControlError,
@@ -55,7 +51,6 @@ from skillspector.providers.structured_output import (
     rejects_forced_tool_call,
     rejects_sampling_controls,
 )
-from skillspector.structured_response import ResponseIssue
 
 
 class Verdict(BaseModel):
@@ -75,19 +70,11 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch):
         "SKILLSPECTOR_SEED",
         "SKILLSPECTOR_REASONING_EFFORT",
         "SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_AUTH_SCHEME",
-        "ANTHROPIC_PROXY_API_KEY",
-        "ANTHROPIC_PROXY_ENDPOINT_URL",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_PROJECT_ID",
         "SKILLSPECTOR_COMPAT_API_KEY",
         "SKILLSPECTOR_COMPAT_BASE_URL",
-        "AZURE_OPENAI_API_KEY",
-        "AZURE_OPENAI_ENDPOINT",
-        "AZURE_OPENAI_DEPLOYMENT",
         *(f"SKILLSPECTOR_MODEL_{slot.upper()}" for slot in _MODEL_SLOTS),
     ):
         monkeypatch.delenv(name, raising=False)
@@ -199,125 +186,6 @@ class TestClaudeModelRules:
     def test_normalized_ids_carry_the_claude_5_5_rules(self, model: str) -> None:
         assert rejects_forced_tool_call(model)
         assert rejects_sampling_controls(model)
-
-
-def _anthropic_provider(
-    monkeypatch: pytest.MonkeyPatch, provider_cls: type
-) -> AnthropicProvider | AnthropicProxyProvider:
-    if provider_cls is AnthropicProvider:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "anthropic")
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-    else:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "anthropic_proxy")
-        monkeypatch.setenv("ANTHROPIC_PROXY_API_KEY", "proxy-token")
-        monkeypatch.setenv("ANTHROPIC_PROXY_ENDPOINT_URL", "https://proxy.example.com/predict")
-    return provider_cls()
-
-
-def _stub_anthropic(monkeypatch: pytest.MonkeyPatch, answer: AIMessage) -> list[dict]:
-    """Record each request payload ``ChatAnthropic`` would send and answer with *answer*."""
-    requests: list[dict] = []
-
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        requests.append(self._get_request_payload(messages, stop=stop, **kwargs))
-        return ChatResult(generations=[ChatGeneration(message=answer)])
-
-    monkeypatch.setattr(ChatAnthropic, "_generate", _generate)
-    return requests
-
-
-_ANTHROPIC_PROVIDERS = pytest.mark.parametrize(
-    "provider_cls", [AnthropicProvider, AnthropicProxyProvider]
-)
-
-
-class TestAnthropicClaude55:
-    """Native Messages API and Vertex-style proxy requests for Claude Opus and Sonnet 5.5."""
-
-    @_ANTHROPIC_PROVIDERS
-    @pytest.mark.parametrize("model", _CLAUDE_5_5)
-    def test_json_schema_request_without_tools_parses_past_thinking(
-        self, monkeypatch: pytest.MonkeyPatch, provider_cls: type, model: str
-    ) -> None:
-        provider = _anthropic_provider(monkeypatch, provider_cls)
-        answer = AIMessage(
-            content=[
-                {"type": "thinking", "thinking": "", "signature": "sig"},
-                {"type": "text", "text": '{"ok": true}'},
-            ]
-        )
-        requests = _stub_anthropic(monkeypatch, answer)
-        llm = provider.create_chat_model(model, max_tokens=provider.get_max_output_tokens(model))
-
-        chain = bind_structured_output(llm, Verdict, model, provider)
-
-        assert chain.invoke("analyse this") == Verdict(ok=True)
-        request = requests[0]
-        assert request["output_config"]["format"]["type"] == "json_schema"
-        assert "tools" not in request and "tool_choice" not in request
-        assert request["max_tokens"] == 128_000
-
-    @_ANTHROPIC_PROVIDERS
-    def test_refusal_is_never_a_parsed_result(
-        self, monkeypatch: pytest.MonkeyPatch, provider_cls: type
-    ) -> None:
-        provider = _anthropic_provider(monkeypatch, provider_cls)
-        _stub_anthropic(
-            monkeypatch, AIMessage(content=[], response_metadata={"stop_reason": "refusal"})
-        )
-        llm = provider.create_chat_model("claude-opus-5-5", max_tokens=1_000)
-
-        chain = bind_structured_output(llm, Verdict, "claude-opus-5-5", provider)
-
-        # A refusal remains incomplete and cannot trigger formatting or blind retries.
-        with pytest.raises(StructuredOutputParseError) as error:
-            chain.invoke("analyse this")
-        assert error.value.issue == ResponseIssue.REFUSED
-        assert not error.value.retryable
-
-    @pytest.mark.parametrize(
-        ("provider_cls", "temperature"),
-        [(AnthropicProvider, "0"), (AnthropicProxyProvider, "0"), (AnthropicProxyProvider, "1.0")],
-    )
-    @pytest.mark.parametrize("model", _CLAUDE_5_5)
-    def test_explicit_temperature_fails_before_any_request(
-        self, monkeypatch: pytest.MonkeyPatch, provider_cls: type, model: str, temperature: str
-    ) -> None:
-        provider = _anthropic_provider(monkeypatch, provider_cls)
-        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", temperature)
-
-        with pytest.raises(
-            ValueError, match=f"SKILLSPECTOR_TEMPERATURE is not supported by {model}"
-        ):
-            provider.create_chat_model(model, max_tokens=1_000)
-
-    @_ANTHROPIC_PROVIDERS
-    def test_missing_credentials_win_over_an_incompatible_temperature(
-        self, monkeypatch: pytest.MonkeyPatch, provider_cls: type
-    ) -> None:
-        # No credentials keep returning None, so the OpenAI fallback still runs.
-        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
-        assert provider_cls().create_chat_model("claude-opus-5-5", max_tokens=1_000) is None
-
-    @_ANTHROPIC_PROVIDERS
-    def test_other_claude_models_keep_temperature(
-        self, monkeypatch: pytest.MonkeyPatch, provider_cls: type
-    ) -> None:
-        provider = _anthropic_provider(monkeypatch, provider_cls)
-        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
-        llm = provider.create_chat_model("claude-opus-4-6", max_tokens=1_000)
-        assert llm.temperature == 0.2
-
-    @_ANTHROPIC_PROVIDERS
-    @pytest.mark.parametrize(
-        "model", ["aws/anthropic/bedrock-claude-opus-5-5", "azure/anthropic/claude-sonnet-5-5"]
-    )
-    def test_gateway_ids_use_json_schema(self, provider_cls: type, model: str) -> None:
-        assert provider_cls().structured_output_method(model) == "json_schema"
-
-    @_ANTHROPIC_PROVIDERS
-    def test_gateway_ids_for_other_models_keep_the_default(self, provider_cls: type) -> None:
-        assert provider_cls().structured_output_method("azure/anthropic/claude-opus-5") is None
 
 
 def _stub_openai(monkeypatch: pytest.MonkeyPatch, answers: list[AIMessage]) -> list[dict]:
@@ -562,35 +430,10 @@ class TestOpenAIProtocolControls:
         assert chat_model_controls(llm)["seed"] == 42
 
 
-class TestAzureOpenAIControls:
-    """Azure OpenAI deployments of GPT-6.1 Sol get the same temperature guard."""
-
-    @pytest.fixture(autouse=True)
-    def _azure_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-test")
-        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com")
-
-    def test_explicit_temperature_fails_before_any_request(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
-        with pytest.raises(
-            UnsupportedControlError,
-            match="SKILLSPECTOR_TEMPERATURE is not supported by gpt-6.1-sol",
-        ):
-            AzureOpenAIProvider().create_chat_model("gpt-6.1-sol", max_tokens=1_000)
-
-    def test_other_models_keep_temperature(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
-        llm = AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1_000)
-        assert chat_model_requested_controls(llm)["temperature"] == 0.2
-
-
 _OPT_IN_MODEL_ENV = pytest.mark.parametrize(
     ("provider", "credential", "model"),
     [
         ("openai", "OPENAI_API_KEY", "gpt-6.1-sol"),
-        ("anthropic", "ANTHROPIC_API_KEY", "claude-opus-5-5"),
     ],
 )
 
@@ -718,12 +561,6 @@ class TestScanPreflightControls:
         monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-5.4")
         assert unsupported_control_error() is None
         assert is_llm_available() == (True, None)
-
-    def test_cli_providers_are_not_checked(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
-        monkeypatch.setenv("SKILLSPECTOR_MODEL", "gpt-6.1-sol")
-        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
-        assert unsupported_control_error() is None
 
     def test_no_llm_scan_ignores_rejected_controls(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

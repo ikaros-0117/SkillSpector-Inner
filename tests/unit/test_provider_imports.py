@@ -48,7 +48,7 @@ def _run_python(code: str, *, provider: str) -> subprocess.CompletedProcess[str]
     )
 
 
-@pytest.mark.parametrize("provider", ["nv_build", ""])
+@pytest.mark.parametrize("provider", ["openai", "openai_compatible", ""])
 def test_metadata_import_does_not_load_chat_client_stack(provider: str) -> None:
     result = _run_python(
         "import sys\n"
@@ -61,9 +61,7 @@ def test_metadata_import_does_not_load_chat_client_stack(provider: str) -> None:
         "    name for name in (\n"
         "        'skillspector.providers.chat_models',\n"
         "        'langchain_openai',\n"
-        "        'langchain_anthropic',\n"
         "        'openai',\n"
-        "        'anthropic',\n"
         "    )\n"
         "    if name in sys.modules\n"
         "]\n"

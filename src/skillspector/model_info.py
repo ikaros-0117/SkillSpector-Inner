@@ -15,16 +15,14 @@
 
 """Model metadata helpers — token-budget resolution.
 
-Layered resolution lives in :mod:`skillspector.providers`; this module is
-the public façade that callers (e.g. ``llm_utils``, ``llm_analyzer_base``)
-import from.  Test fixtures patch :func:`_resolve_context_length` here.
+Providers supply registry limits through :mod:`skillspector.providers`.  Test fixtures patch :func:`_resolve_context_length` here.
 """
 
 from __future__ import annotations
 
 from skillspector.constants import DEFAULT_CONTEXT_LENGTH, MAX_INPUT_TOKENS_PCT
 from skillspector.logging_config import get_logger
-from skillspector.providers import get_metadata_provider
+from skillspector.providers import get_model_config_provider
 
 logger = get_logger(__name__)
 
@@ -32,11 +30,10 @@ logger = get_logger(__name__)
 def _resolve_context_length(model_label: str) -> int:
     """Return the context window size for *model_label*.
 
-    Delegates to the configured provider chain; falls back to
-    :data:`DEFAULT_CONTEXT_LENGTH` with a warning when no provider knows
-    about the model.
+    Uses the provider selected for chat-model construction. An unknown model falls back to
+    :data:`DEFAULT_CONTEXT_LENGTH` and logs a warning.
     """
-    ctx = get_metadata_provider().get_context_length(model_label)
+    ctx = get_model_config_provider().get_context_length(model_label)
     if ctx is not None:
         logger.debug("Resolved %r context length: %d", model_label, ctx)
         return ctx
@@ -59,13 +56,12 @@ def get_max_output_tokens(model: str) -> int:
     """Output token budget for *model*.
 
     Uses the smaller of the percentage-based budget and any explicit
-    ``max_output_tokens`` cap exposed by the provider chain (today: only
-    the YAML registry surfaces this).
+    ``max_output_tokens`` cap in the selected provider's registry.
     """
     ctx = _resolve_context_length(model)
     pct_budget = int(ctx * (1 - MAX_INPUT_TOKENS_PCT))
 
-    cap = get_metadata_provider().get_max_output_tokens(model)
+    cap = get_model_config_provider().get_max_output_tokens(model)
     if cap is not None:
         return min(pct_budget, cap)
     return pct_budget

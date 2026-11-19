@@ -27,7 +27,7 @@ import pytest
 
 
 def _run_python(
-    code: str, *args: str, provider: str = "nv_build"
+    code: str, *args: str, provider: str = "openai"
 ) -> subprocess.CompletedProcess[str]:
     # Keep platform essentials, but exclude inherited credentials and scanner options.
     env = {
@@ -53,7 +53,7 @@ def _run_python(
     )
 
 
-def _run_cli(*args: str, provider: str = "nv_build") -> subprocess.CompletedProcess[str]:
+def _run_cli(*args: str, provider: str = "openai") -> subprocess.CompletedProcess[str]:
     return _run_python("from skillspector.cli_entry import app; app()", *args, provider=provider)
 
 

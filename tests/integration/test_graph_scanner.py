@@ -15,8 +15,8 @@
 
 """Graph-invoke tests with safe/malicious skill dirs.
 
-These tests exercise the deterministic scanner path.  Live provider behavior is
-covered separately in ``test_agent_cli_live.py``.
+These tests exercise the deterministic scanner path.  The live endpoint check
+lives in ``tests/provider/test_provider_endpoint.py``.
 """
 
 from pathlib import Path

@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # % of model's max tokens used for input. 1-MAX_INPUT_TOKENS_PCT is used for output.
 MAX_INPUT_TOKENS_PCT = 0.75
-# Fallback context length when no metadata API or registry entry is available.
+# Fallback context length when the provider's registry has no matching entry.
 DEFAULT_CONTEXT_LENGTH = 128_000
 # Risk score threshold above which a scan is treated as unsafe.
 RISK_THRESHOLD = 50
@@ -48,8 +48,7 @@ MAX_LLM_TRUNCATED_FILE_CHARS = 262_144
 # Default-model selection lives on each provider (see providers/<name>/provider.py
 # for ``DEFAULT_MODEL`` and ``SLOT_DEFAULTS``).  The active provider's
 # ``resolve_model`` runs the waterfall: ``SKILLSPECTOR_MODEL`` env > slot
-# default > general default.  OSS users pointing at build.nvidia.com or
-# stock OpenAI inherit ``NvBuildProvider``'s default model automatically.
+# default > general default.
 _provider: ModelMetadataProvider | None
 try:
     _provider = get_metadata_provider()

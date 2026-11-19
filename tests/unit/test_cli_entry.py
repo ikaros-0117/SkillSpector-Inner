@@ -23,7 +23,7 @@ def _entry_point() -> tuple[str, str]:
 
 
 @pytest.mark.parametrize("flag", ["--version", "-v"])
-@pytest.mark.parametrize("provider", ["nv_build", "anthropic", "invalid-provider"])
+@pytest.mark.parametrize("provider", ["openai", "openai_compatible", "invalid-provider"])
 def test_version_does_not_import_scan_stack(flag: str, provider: str) -> None:
     module, name = _entry_point()
     code = f"""
@@ -37,8 +37,8 @@ class RejectScanStack(importlib.abc.MetaPathFinder):
             "skillspector.cli", "skillspector.constants", "skillspector.providers",
             "skillspector.nodes", "skillspector.graph", "langgraph",
             "langchain_core.runnables", "langchain_core.language_models",
-            "langchain_openai", "langchain_anthropic", "langchain_aws",
-            "openai", "anthropic", "boto3",
+            "langchain_openai",
+            "openai",
         )
         if any(fullname == p or fullname.startswith(p + ".") for p in blocked):
             raise AssertionError("Version loaded scanning dependency: " + fullname)

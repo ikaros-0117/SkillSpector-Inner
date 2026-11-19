@@ -74,7 +74,7 @@ def _scan(
     }
     env.update(
         PYTHONPATH=str(Path(__file__).resolve().parents[2] / "src"),
-        SKILLSPECTOR_PROVIDER="nv_build",
+        SKILLSPECTOR_PROVIDER="openai",
         LANGSMITH_TRACING="false",
         LANGCHAIN_TRACING_V2="false",
         NO_COLOR="1",

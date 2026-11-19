@@ -536,88 +536,18 @@ flowchart TD
     end
 ```
 
-## Appendix E: Layered Model Resolution and Open-Source Portability
+## Appendix E: Provider and model resolution
 
-### 1. Layered Resolution Approach
+`model_info.py` reads the active chat provider's bundled YAML registry for
+context and output budgets. Set `SKILLSPECTOR_MODEL_REGISTRY` to use a
+custom file. A model with no context entry uses the 128,000-token default
+and logs a warning.
 
-Every LLM call needs to know the model's token limits (context window size)
-so prompts and chunks fit within budget.  Rather than hardcoding limits or
-relying on a single metadata source, `model_info.py` resolves token limits
-through a **layered fallback chain**:
-
-```mermaid
-flowchart TD
-    caller["get_max_input_tokens / get_max_output_tokens"]
-    resolve["_resolve_context_length(model)"]
-    cache{"Result cached for model?"}
-    cached_result["Return cached context_length"]
-    layer1{"Active NVIDIA provider supplies metadata?"}
-    api["Layer 1: active NVIDIA provider"]
-    layer2["Layer 2: YAML registry lookup"]
-    registry{"Model in registry (local yaml)?"}
-    fallback["Fallback: 128k default + warning"]
-    result["Return & cache context_length"]
-
-    caller --> resolve
-    resolve --> cache
-    cache -->|yes| cached_result
-    cache -->|no| layer1
-    layer1 -->|yes| api
-    api -->|success| result
-    api -->|"failure (network, not found)"| layer2
-    layer1 -->|no| layer2
-    layer2 --> registry
-    registry -->|yes| result
-    registry -->|no| fallback
-    fallback --> result
-
-```
-
-| Layer | Activation | Description |
-|-------|-----------|-------------|
-| Layer 1 | The active NVIDIA provider in `src/skillspector/providers/` returns a non-`None` answer | Optional source of dynamic token limits; falls through silently when unavailable. |
-| Layer 2 | `SKILLSPECTOR_MODEL_REGISTRY` env var is set | Looks up the model in the YAML file pointed to by the env var. A reference `model_registry.yaml` is included in the repo root. |
-| Fallback | Neither layer resolved | Returns a conservative 128 000-token default and logs a warning prompting the user to add the model to the registry. |
-
-Results are cached per model label for the lifetime of the process
-(`@functools.cache`), so the resolution cost is paid at most once per model.
-
-### 2. Open-Sourcing Plan
-
-#### 2.1 Swappable Inference Endpoint
-
-Skillspector's LLM inference is built on LangChain's `ChatOpenAI`, which
-speaks the **OpenAI Chat Completions API**.  The base URL is configured via
-`INFERENCE_API_BASE_URL` in `constants.py` and can be overridden per call
-through `get_chat_model(base_url=...)` in `llm_utils.py`.
-
-Any provider that implements the OpenAI completions schema works as a
-drop-in replacement:
-
-| Provider | Configuration |
-|----------|---------------|
-| OpenAI | `INFERENCE_API_BASE_URL=https://api.openai.com/v1` |
-| Azure OpenAI | Set the Azure endpoint as `INFERENCE_API_BASE_URL` |
-| vLLM | `INFERENCE_API_BASE_URL=http://localhost:8000/v1` |
-| Ollama | `INFERENCE_API_BASE_URL=http://localhost:11434/v1` |
-| LiteLLM proxy | `INFERENCE_API_BASE_URL=http://localhost:4000/v1` |
-
-No code changes are required — only the environment variable (or a one-line
-constant update) needs to change.
-
-#### 2.2 Manual Specification of model_registry.yaml
-
-For environments **without** access to the NVIDIA Inference Hub metadata
-API (i.e. most open-source deployments), model token limits are provided
-through a YAML registry file.
-
-The registry is **not** bundled inside the pip package — since the tool is
-designed to work with any OpenAI-compatible provider, the specific models
-and their limits depend entirely on the user's environment.
-
-**Reference file** — A pre-populated `model_registry.yaml` is included at
-the repository root as a starting point.  Copy it, edit the models to match
-your environment, and point the env var at it.
+Both providers use LangChain's `ChatOpenAI`. Configure `openai` with
+`OPENAI_API_KEY` and an optional `OPENAI_BASE_URL`, or select
+`openai_compatible` and set `SKILLSPECTOR_COMPAT_API_KEY` and
+`SKILLSPECTOR_COMPAT_BASE_URL`. Start a custom registry with the example
+[model_registry.yaml](../model_registry.yaml).
 
 **File format:**
 
@@ -640,5 +570,4 @@ variable to point at your registry file:
 export SKILLSPECTOR_MODEL_REGISTRY=./model_registry.yaml
 ```
 
-When this env var is unset, Layer 2 is inactive and resolution falls
-through to the 128k default for any model not found via the metadata API.
+When this variable is unset, SkillSpector uses the selected provider's bundled registry.

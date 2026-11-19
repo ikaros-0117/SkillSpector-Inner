@@ -30,12 +30,12 @@ records setup and check results separately from full PR validation.
 
 - **Installation**: `make install` and `make install-dev` use **uv** if available (`uv sync` / `uv sync --all-extras`), otherwise **pip** (`pip install -e .` / `pip install -e ".[dev]"`).
 - **Environment**: Export the variables used by your scan or load an optional `.env` file with `uv run --env-file .env`. Key variables:
-  - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Defaults to `nv_build` when unset.
-  - **Provider credential**: depends on the active provider. Hosted providers use the matching variables in [.env.example](../.env.example); Ollama and CLI providers do not require an API key. See [providers/](../src/skillspector/providers/).
-  - **`OPENAI_BASE_URL`**: Override the OpenAI endpoint (e.g. point at Ollama).
-  - **`SKILLSPECTOR_MODEL`**: Override default model; see [constants.py](../src/skillspector/constants.py). OpenAI retains `gpt-5.4`; Anthropic retains `claude-opus-4-6` with `claude-sonnet-4-6` for `meta_analyzer`. Sol and Claude 5.5 remain opt-in pending the [live scanner acceptance described in the README](../README.md#llm-analysis).
-  - **`SKILLSPECTOR_TEMPERATURE`**: Optional hosted-provider sampling temperature from `0` to `1`. `gpt-6.1-sol` rejects every explicit value. Claude Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5 and Haiku 5 models (for example `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`) accept only `1.0` on the native Anthropic endpoint; other routes reject every explicit value. Unsupported settings on active LLM slots stop the scan before analysis. Static scans skip provider initialization and control validation.
-  - **`SKILLSPECTOR_SEED`**: Optional integer seed for OpenAI-compatible and Azure OpenAI providers.
+  - **`SKILLSPECTOR_PROVIDER`** selects `openai` (default) or `openai_compatible`.
+  - **`OPENAI_API_KEY`** configures OpenAI. **`OPENAI_BASE_URL`** can point to a compatible endpoint.
+  - **`SKILLSPECTOR_COMPAT_API_KEY`** and **`SKILLSPECTOR_COMPAT_BASE_URL`** configure the dedicated compatible provider.
+  - **`SKILLSPECTOR_MODEL`** overrides the provider's default. See the [LLM configuration examples](../README.md#llm-analysis).
+  - **`SKILLSPECTOR_TEMPERATURE`** sets an optional sampling temperature from `0` to `1` for models that support it.
+  - **`SKILLSPECTOR_SEED`** sets an optional integer sampling seed.
 
 - **Logging**: Internal/operational logging uses the stdlib `logging` module. User-facing output (report body, errors, progress) uses Rich `console.print()`.
   - **Env**: `SKILLSPECTOR_LOG_LEVEL` (DEBUG, INFO, WARNING, ERROR). Default is `"WARNING"` (defined in [constants.py](../src/skillspector/constants.py)).
@@ -231,7 +231,7 @@ has checks suited to its environment.
 | Lint and formatting | Ruff lint and format checks | The same Ruff lint and format checks |
 | Unit tests | Non-integration, non-provider tests with coverage | The same unit-test set with Cobertura coverage artifacts |
 | Integration tests | Not run | Full-graph integration suite; these tests may call configured LLM providers |
-| Live provider tests | Not run | Optional manual tests against OpenAI, Anthropic, and NVIDIA Build using masked CI credentials |
+| Live provider tests | Not run | Optional manual test against OpenAI using a masked CI credential |
 | Static analysis | OpenSSF Scorecard runs in a separate public workflow | SonarQube runs after unit tests and is currently non-blocking |
 | Contribution policy | DCO sign-off check on pull requests | No separate DCO job |
 | Automated review | No review bot job is defined in the workflow | CodeRabbit is connected through an external integration/webhook, not a runner job |
@@ -288,40 +288,25 @@ To use an environment file, copy [.env.example](../.env.example) to `.env` in th
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai` \| `anthropic` \| `anthropic_proxy` \| `bedrock` \| `nv_build` \| `ollama` \| `azure_openai` \| `openai_compatible` \| `claude_cli` \| `gemini_cli` \| `opencode_cli`. Defaults to `nv_build`. | `claude_cli` |
-| `NVIDIA_INFERENCE_KEY` | Credential for `nv_build`. | `nvapi-...` |
-| `OPENAI_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai`. Also tier-2 fallback for non-OpenAI providers. | `sk-...` |
+| `SKILLSPECTOR_PROVIDER` | Active provider. Choose `openai` (default) or `openai_compatible`. | `openai_compatible` |
+| `OPENAI_API_KEY` | Credential for `openai` and the fallback for an unconfigured `openai_compatible`. | `sk-...` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
-| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3-flash`; other provider/model combinations keep their endpoint defaults. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | `high` |
+| `SKILLSPECTOR_REASONING_EFFORT` | Optional reasoning effort passed to the endpoint. Unset or blank preserves the endpoint default. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`. Unsupported values for that model stop the scan before analysis (exit code 2). | `high` |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Optional short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | `Japanese` |
-| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves provider defaults. Lower values reduce variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit value. Claude Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5 and Haiku 5 models (for example `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`) accept `1.0` on the native Anthropic endpoint only ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)). Unsupported settings on active LLM slots stop a scan before analysis (exit code 2); static scans skip provider initialization and these checks. Leave it unset to preserve the default models’ endpoint defaults. | `0` |
-| `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Provider/model support is best-effort; CLI providers ignore it. | `42` |
-| `ANTHROPIC_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=anthropic`. | `sk-ant-...` |
-| `OLLAMA_BASE_URL` | Optional Ollama endpoint override. | `http://localhost:11434/v1` |
-| `AZURE_OPENAI_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=azure_openai`. | `...` |
-| `AZURE_OPENAI_ENDPOINT` | Azure resource endpoint. | `https://example.openai.azure.com/` |
+| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1`. Unset or blank preserves the endpoint default. `gpt-6.1-sol` and Claude models from the Opus 4.7+, Sonnet 5, Fable 5, Mythos 5, and Haiku 5 families reject explicit temperature on these two provider routes. Static scans skip provider initialization and control validation. | `0` |
+| `SKILLSPECTOR_SEED` | Optional signed 64-bit integer sampling seed. Endpoint and model support is best-effort. | `42` |
 | `SKILLSPECTOR_COMPAT_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai_compatible`. | `...` |
 | `SKILLSPECTOR_COMPAT_BASE_URL` | OpenAI-compatible endpoint base URL. | `https://api.groq.com/openai/v1` |
 | `SKILLSPECTOR_COMPAT_HEADERS` | Optional JSON object with string header names and values for `openai_compatible`. Applies to sync and async requests; unset or blank adds no headers. Invalid configuration is rejected without exposing header values. May contain gateway API keys, so treat it as a secret. | `{"X-Tenant-ID":"my-tenant","X-API-Key":"gateway-key"}` |
-| `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). CLI providers forward it as `--model`. | `gpt-5.2` |
-
-> **Disabled provider:** `codex_cli` remains registered for compatibility but refuses inference until a complete no-tools policy is verified.
-
-> **CLI providers** (`claude_cli`, `gemini_cli`, `opencode_cli`): no credential env var is needed. Authentication is managed by the agent CLI's own session. The subprocess is heavily sandboxed — see [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py).
+| `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model. | `gpt-5.2` |
 
 ### Live provider tests
 
-The manual `test-provider` CI job and local `make test-provider` target perform live requests against provider default endpoints. Missing provider keys print a `WARNING:` line before pytest runs and skip that provider. In CI, missing keys also make the manual job exit with the configured warning code so GitLab displays the job as passed with warnings; if a key is present but invalid, or the provider request fails, the corresponding test fails.
-
-| Command | Required env var | Default URL | Optional model override |
-|---------|------------------|-------------|-------------------------|
-| `make test-provider openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | `SKILLSPECTOR_OPENAI_TEST_MODEL` |
-| `make test-provider anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` | `SKILLSPECTOR_ANTHROPIC_TEST_MODEL` |
-| `make test-provider nv_build` | `NVIDIA_INFERENCE_KEY` | `https://integrate.api.nvidia.com/v1` | `SKILLSPECTOR_NV_BUILD_TEST_MODEL` |
-| `make test-provider gemini` | `GOOGLE_CLOUD_PROJECT` | `https://aiplatform.googleapis.com/v1/...` | `SKILLSPECTOR_GEMINI_TEST_MODEL` |
-| `make test-provider` | Any/all of the provider keys above | All provider default URLs above | Any/all provider model overrides above |
-
-Base URL env vars are not needed for live provider tests; the tests intentionally use provider defaults.
+Run `make test-provider openai` to test `https://api.openai.com/v1`.
+The test requires `OPENAI_API_KEY` and uses the default OpenAI model
+unless `SKILLSPECTOR_OPENAI_TEST_MODEL` is set. Without an API key, the
+target warns and skips the live request. Run `make test-provider` for
+the full provider test suite, including opt-in semantic evaluations.
 
 ### Constants, token budgets, and LLM
 
@@ -329,26 +314,10 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
   - **`get_max_input_tokens(model)`** — input budget per LLM request (75% of resolved context window).
   - **`get_max_output_tokens(model)`** — output budget per LLM request (min of 25% context, registry's `max_output_tokens` cap if set).
   - Batch budget overhead is computed per-prompt via `estimate_tokens(base_prompt)` rather than a fixed constant.
-- **Providers** ([providers/](../src/skillspector/providers/)): pluggable credential + token-budget resolvers. Each provider is a subpackage with its own `provider.py` and bundled `model_registry.yaml`; [registry.py](../src/skillspector/providers/registry.py) exposes `lookup_context_length` / `lookup_max_output_tokens` utilities the providers call directly. The active provider is chosen by `SKILLSPECTOR_PROVIDER` (default: `nv_build`):
-  - `nv_build/` — build.nvidia.com (HTTP, `NVIDIA_INFERENCE_KEY`)
-  - `openai/` — api.openai.com or any OpenAI-compatible URL (`OPENAI_API_KEY`)
-  - `anthropic/` — api.anthropic.com (`ANTHROPIC_API_KEY`)
-  - `anthropic_proxy/` — Vertex-style proxy (`ANTHROPIC_PROXY_API_KEY`, `ANTHROPIC_PROXY_ENDPOINT_URL`)
-  - `bedrock/` — AWS Bedrock Runtime (standard boto3 credential chain)
-  - `gemini/` — Google Cloud OpenAI-compatible Gemini endpoint (`GOOGLE_CLOUD_PROJECT`, ADC / Workload Identity)
-  - `ollama/` — local Ollama OpenAI-compatible endpoint (no API key)
-  - `azure_openai/` — Azure OpenAI Service (`AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`)
-  - `openai_compatible/` — generic compatible endpoint (`SKILLSPECTOR_COMPAT_API_KEY`, `SKILLSPECTOR_COMPAT_BASE_URL`)
-  - `claude_cli/` — **local `claude` binary; no API key**. Uses the CLI's own auth session (`claude auth login`). Set `SKILLSPECTOR_PROVIDER=claude_cli`.
-  - `codex_cli/` — **registered but disabled**. Its read-only sandbox permits host-file reads. Select an HTTP API provider or another supported CLI provider for LLM analysis.
-  - `gemini_cli/` — **local `gemini` binary; no API key**. Uses the CLI's own auth session. Set `SKILLSPECTOR_PROVIDER=gemini_cli`.
-  - `opencode_cli/` — **local `opencode` (verified 1.18.31–1.18.35, 1.19.0–1.19.4) binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version, including prereleases, because the deny-all policy is verified against those exact releases. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
-
-  CLI providers (`claude_cli`, `gemini_cli`, `opencode_cli`) implement the optional `AgentCLICapable` interface (`is_available()` + `complete()`) defined in [providers/base.py](../src/skillspector/providers/base.py). `has_cli_capability(provider)` detects this at runtime. All subprocess calls go through the hardened helper [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py) which enforces: no shell (`shell=False`), untrusted content via stdin only, capability stripping (tools disabled / sandboxed), environment scrubbing (no API keys forwarded), per-call timeout, and fail-closed error handling.
-
-- **LLM calls** ([llm_utils.py](../src/skillspector/llm_utils.py)): **`get_chat_model()`** and **`chat_completion()`** dispatch based on the active provider:
-  - **HTTP providers**: resolve credentials in two tiers — active provider (`NVIDIA_INFERENCE_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` → endpoint) — against any OpenAI-compatible endpoint. `max_tokens` is auto-bound to `get_max_output_tokens(model)` from `model_info`.
-  - **CLI providers** (`claude_cli`, `gemini_cli`, `opencode_cli`): `get_chat_model()` returns an `AgentCLIChatModel` adapter backed by `provider.complete()`, so the analyzers' `.invoke()` / `.with_structured_output(schema).invoke()` calls work with no API key (structured output is produced by prompting for JSON, then Pydantic-validating). `chat_completion()` routes through `get_chat_model()` as well. `is_llm_available()` calls `provider.is_available()` instead of credential resolution.
+- **Providers** ([providers/](../src/skillspector/providers/)) resolve credentials and token budgets. Each provider bundles a `model_registry.yaml` and looks up model limits through [registry.py](../src/skillspector/providers/registry.py).
+  - `openai/` is the default. It uses `OPENAI_API_KEY` and supports the `OPENAI_BASE_URL` override.
+  - `openai_compatible/` uses `SKILLSPECTOR_COMPAT_API_KEY` and `SKILLSPECTOR_COMPAT_BASE_URL`, with optional gateway headers.
+- **LLM calls** ([llm_utils.py](../src/skillspector/llm_utils.py)) use the active provider's OpenAI-protocol chat model. The output token cap comes from `get_max_output_tokens(model)` in `model_info`.
 - **LLM analyzer base** ([llm_analyzer_base.py](../src/skillspector/llm_analyzer_base.py)): `LLMAnalyzerBase` provides per-file/per-chunk batching, token-budget-aware chunking, and a run loop for all LLM-based analyzers. `LLMMetaAnalyzer` extends it for filter/enrich (meta_analyzer node). Future semantic analyzers extend `LLMAnalyzerBase` for discovery mode.
 
 ---

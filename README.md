@@ -211,27 +211,14 @@ not suppress findings in included files or override existing safety limits.
 
 ### LLM Analysis
 
-For the best results, configure an OpenAI-compatible LLM endpoint for
-semantic analysis. Pick a provider with `SKILLSPECTOR_PROVIDER`; hosted providers ship bundled default models, while CLI providers fall back to the local runtime's default model unless `SKILLSPECTOR_MODEL` is set. SkillSpector also works against
-local OpenAI-compatible servers (Ollama, vLLM, llama.cpp) and managed
-inference gateways.
+Set `SKILLSPECTOR_PROVIDER` to select an endpoint for semantic analysis.
+It defaults to `openai`. Both providers support hosted gateways and local
+servers that implement the OpenAI API, such as vLLM, Ollama, and llama.cpp.
 
 | Provider (`SKILLSPECTOR_PROVIDER`) | Credential env var | Endpoint | Default model |
 | ---------- | ---- | ---- | ---- |
 | `openai` | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | api.openai.com (or any OpenAI-compatible URL) | `gpt-5.4` |
-| `anthropic` | `ANTHROPIC_API_KEY` | api.anthropic.com | `claude-opus-4-6` (`meta_analyzer`: `claude-sonnet-4-6`) |
-| `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
-| `minimax` | `MINIMAX_API_KEY` (+ optional `MINIMAX_REGION`) | Global or China regional endpoint | `MiniMax-M3.1-Flash` |
-| `bedrock` | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime | `us.anthropic.claude-sonnet-4-6` |
-| `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `z-ai/glm-5.3-flash` |
-| `gemini` | `GOOGLE_CLOUD_PROJECT` (+ optional `GOOGLE_CLOUD_LOCATION`) via ADC | Google Cloud OpenAI-compatible Gemini endpoint | `gemini-3.8-flash` |
-| `ollama` | _(none)_ | `OLLAMA_BASE_URL` (default `http://localhost:11434/v1`) | `llama3.1:8b` |
-| `azure_openai` | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` | Azure OpenAI Service | `gpt-4o` (deployment defaults to the model label) |
 | `openai_compatible` | `SKILLSPECTOR_COMPAT_API_KEY` + `SKILLSPECTOR_COMPAT_BASE_URL` | Any OpenAI-compatible endpoint | `llama-3.1-70b-versatile` |
-| `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
-| `codex_cli` | Disabled | Registered for compatibility; its read-only sandbox permits host-file reads | Use an HTTP API provider or another supported CLI provider |
-| `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
-| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` (verified 1.18.31–1.18.35, 1.19.0–1.19.4) binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
 
 For `openai_compatible` gateways requiring extra HTTP headers, set
 `SKILLSPECTOR_COMPAT_HEADERS='{"X-Tenant-ID":"my-tenant","X-API-Key":"gateway-key"}'`.
@@ -246,34 +233,12 @@ injection, refusals, and incomplete responses.
 Record findings, completion status, latency, and usage, and compare against
 previous defaults where accessible.
 
-For NVIDIA Build's `z-ai/glm-5.3-flash`, SkillSpector requests `high` reasoning effort.
-Set `SKILLSPECTOR_REASONING_EFFORT` to override it with `low`, `high`, or `max`.
-The bundled 128,000-token context and 32,000-token output budgets are conservative
-application limits; they do not claim the hosted endpoint's maximum capacity.
-
-Structured output is requested through LangChain's `with_structured_output`.
-The default is client-specific: `ChatOpenAI` uses `json_schema`, while other
-clients may use tool calling. Some models reject a forced tool call with
-HTTP 400 (`tool_choice: type "tool" and "any" are not supported for this
-model`). The `anthropic` and `anthropic_proxy` providers route those models
-(`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1`, `claude-mythos-5-1`,
-or any registry entry with `structured_output: json_schema`) to the native
-JSON-schema response format.
-Bedrock has no JSON-schema output for them, so the `bedrock` provider leaves
-`toolChoice` at `auto`, asks for the tool call in the prompt, and retries a
-prose answer; it recognises the model from the model ID, a geo/global
-inference-profile ID, or a foundation-model / inference-profile ARN. An
-application-inference-profile ARN hides the model, so add that ARN to the
-registry (`SKILLSPECTOR_MODEL_REGISTRY`) with `tool_choice: auto`.
-The `openai_compatible` provider honours the same `tool_choice: auto` entry
-for endpoints that ignore both `response_format` and a forced `tool_choice`
-and answer in prose (for example iFlytek's `spark-x2.5`, which is bundled).
-The `anthropic`, `anthropic_proxy`, `openai`, and `openai_compatible` providers
-also recognise those Claude models inside gateway model IDs such as
-`anthropic/claude-opus-5-5` or `aws/anthropic/bedrock-claude-opus-5-5`. Some
-OpenAI-compatible gateways turn a `json_schema` response format for Claude into
-a forced tool call, so the `openai` and `openai_compatible` providers bind the
-schema as a tool with `tool_choice` left at `auto` and retry a prose answer.
+Structured output uses LangChain's `with_structured_output` and defaults to
+`json_schema`. Both providers recognize gateway model IDs for Claude models
+that reject forced tool calls, such as `anthropic/claude-opus-5-5`. For those
+models, they bind the schema as a tool with automatic tool choice and retry
+prose answers. A model registry entry with `tool_choice: auto` also enables
+this behavior for models such as iFlytek's bundled `spark-x2.5`.
 `SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD=json_schema|function_calling`
 overrides the method for any provider.
 The method precedence is `SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`, the provider's
@@ -287,97 +252,6 @@ environment override or provider hint still wins when reasoning is configured.
 # Stock OpenAI
 export SKILLSPECTOR_PROVIDER=openai
 export OPENAI_API_KEY=sk-...
-skillspector scan ./my-skill/
-
-# Anthropic
-export SKILLSPECTOR_PROVIDER=anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-skillspector scan ./my-skill/
-
-# Anthropic via Vertex-style proxy (corporate gateways, GCP Vertex AI)
-export SKILLSPECTOR_PROVIDER=anthropic_proxy
-export ANTHROPIC_PROXY_ENDPOINT_URL=https://my-gateway.example.com/models/claude-sonnet-4-6:streamRawPredict
-export ANTHROPIC_PROXY_API_KEY=your-bearer-token
-export SKILLSPECTOR_MODEL=claude-sonnet-4-6
-skillspector scan ./my-skill/
-
-# AWS Bedrock (Claude via SigV4)
-export SKILLSPECTOR_PROVIDER=bedrock
-# Optional: select an AWS named profile. When unset, the standard
-# boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves.
-# export AWS_PROFILE=my-profile
-export AWS_REGION=us-west-2  # default if unset
-# Default model: us.anthropic.claude-sonnet-4-6
-# Override with any Bedrock model ID, cross-region inference-profile
-# ID, or your own application-inference-profile ARN. Claude 5.5 is opt-in:
-# us./eu. profiles keep requests in that geography, global. routes worldwide.
-# export SKILLSPECTOR_MODEL=us.anthropic.claude-sonnet-5-5
-skillspector scan ./my-skill/
-
-# NVIDIA build.nvidia.com
-export SKILLSPECTOR_PROVIDER=nv_build
-export NVIDIA_INFERENCE_KEY=nvapi-...
-skillspector scan ./my-skill/
-
-# MiniMax global endpoint; use cn_zh for the China endpoint
-export SKILLSPECTOR_PROVIDER=minimax
-export MINIMAX_API_KEY=your-key
-export MINIMAX_REGION=global_en
-# Default: MiniMax-M3.1-Flash; set SKILLSPECTOR_MODEL=MiniMax-M3 to select M3.
-# Flash reasoning effort: low, medium, high, xhigh, max (endpoint default).
-# Explicit legacy/custom model IDs remain supported through SKILLSPECTOR_MODEL.
-skillspector scan ./my-skill/
-
-# Gemini on Google Cloud (Application Default Credentials / Workload Identity)
-# Prerequisites:
-#   1. Google Cloud project with billing enabled.
-#   2. Enable Gemini Enterprise Agent Platform / Vertex AI API: `aiplatform.googleapis.com`.
-#   3. IAM permission: grant `roles/aiplatform.user` (or at minimum `aiplatform.endpoints.predict`)
-#      to your user account or Kubernetes service account.
-#   4. Local authentication: run `gcloud auth application-default login`.
-#      Configure a quota project if needed: `gcloud auth application-default set-quota-project PROJECT_ID`.
-#   5. Kubernetes / GKE: configure Workload Identity and leave GOOGLE_APPLICATION_CREDENTIALS unset
-#      rather than exporting service account keys.
-# Note on Data Residency:
-#   The default `global` endpoint does not support data-residency requirements. While you can target
-#   `us`, `eu`, or regional endpoints (e.g. `us-central1`), endpoint selection alone does not guarantee
-#   data residency or in-region processing without appropriate organizational policies. Always verify
-#   that your selected model is supported in your target location.
-# Optional credentials:
-#   GOOGLE_APPLICATION_CREDENTIALS is optional and can reference Workload or Workforce Identity Federation
-#   configuration files; exporting long-lived service account keys is discouraged.
-export SKILLSPECTOR_PROVIDER=gemini
-export GOOGLE_CLOUD_PROJECT=my-project-id
-# export GOOGLE_CLOUD_LOCATION=global  # default is global; or us, eu, or specific region (e.g. us-central1)
-# Default model: gemini-3.8-flash
-# export SKILLSPECTOR_MODEL=gemini-3.7-flash
-skillspector scan ./my-skill/
-
-# Local Claude CLI — no API key; uses your existing `claude auth login` session
-# Requires: claude CLI installed and authenticated (claude auth login)
-export SKILLSPECTOR_PROVIDER=claude_cli
-# Uses the local Claude CLI runtime fallback unless SKILLSPECTOR_MODEL is set.
-# export SKILLSPECTOR_MODEL=claude-sonnet-4-6
-skillspector scan ./my-skill/
-
-# Gemini (via OpenAI compatibility layer)
-export SKILLSPECTOR_PROVIDER=openai
-export OPENAI_API_KEY="YOUR_GEMINI_API_KEY"
-export OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
-export SKILLSPECTOR_MODEL=gemini-3.5-flash
-skillspector scan ./my-skill/
-
-# Local Ollama — no API key
-export SKILLSPECTOR_PROVIDER=ollama
-# export OLLAMA_BASE_URL=http://localhost:11434/v1  # shown default
-export SKILLSPECTOR_MODEL=llama3.1:8b
-skillspector scan ./my-skill/
-
-# Azure OpenAI
-export SKILLSPECTOR_PROVIDER=azure_openai
-export AZURE_OPENAI_API_KEY=...
-export AZURE_OPENAI_ENDPOINT=https://example.openai.azure.com/
-export AZURE_OPENAI_DEPLOYMENT=my-deployment
 skillspector scan ./my-skill/
 
 # Any other OpenAI-compatible endpoint
@@ -637,49 +511,24 @@ Issues (2)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `minimax`, `nv_build`, `gemini`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `gemini_cli`, or `opencode_cli`. Hosted providers use bundled `model_registry.yaml` defaults; CLI providers fall back to the local runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
-| `GOOGLE_CLOUD_PROJECT` | Google Cloud project ID for the `gemini` provider. Authenticates via Google Cloud Application Default Credentials (ADC) or GKE Workload Identity. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=gemini` |
-| `GOOGLE_CLOUD_LOCATION` | Google Cloud location for the `gemini` provider endpoint (e.g. `global`, `us`, `eu`, `us-central1`). Defaults to `global`. | Optional (used when `SKILLSPECTOR_PROVIDER=gemini`) |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Optional path to ADC credential/config file (e.g. Workload or Workforce Identity Federation config; exported service account keys are discouraged). For local development, use `gcloud auth application-default login`; for GKE, use Workload Identity. | Optional (used when `SKILLSPECTOR_PROVIDER=gemini`) |
-| `NVIDIA_INFERENCE_KEY` | Credential for the `nv_build` provider (build.nvidia.com). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build` |
-| `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials; the fallback then uses the `openai` default model (`gpt-5.4`) for any slot without a model override. Claude Opus or Sonnet 5.5 gateway IDs are not supported through the fallback, because it keeps the active provider's structured-output method; select `SKILLSPECTOR_PROVIDER=openai` for them. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider. Choose `openai` (default) or `openai_compatible`. | Optional |
+| `OPENAI_API_KEY` | Credential for `openai`. Also used when `openai_compatible` has incomplete credentials. That fallback defaults to `gpt-5.4` for slots without a model override. | Required for the OpenAI route |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
-| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged. When unset or blank, SkillSpector sends `high` for `nv_build` with `z-ai/glm-5.3-flash`; other provider/model combinations keep their endpoint defaults. The value applies to every model slot, so the `anthropic` `meta_analyzer` default receives the same effort as the analyzers. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`; any other value stops a scan before analysis (exit code 2). | Optional |
+| `SKILLSPECTOR_REASONING_EFFORT` | Optional reasoning effort passed to the endpoint. Unset or blank preserves the endpoint default. `gpt-6.1-sol` accepts only `low`, `medium`, `high`, `xhigh`, or `max`. Unsupported values for that model stop the scan before analysis (exit code 2). | Optional |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text such as messages, explanations, and remediation. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | Optional |
-| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. `gpt-6.1-sol` rejects every explicit temperature, including `1`. Claude Opus 4.7 and later, Sonnet 5, Fable 5, Mythos 5 and Haiku 5 models (for example `claude-opus-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`) accept only `1.0` on the native Anthropic endpoint ([API compatibility rule](https://platform.claude.com/docs/en/api/messages/create)); gateways, proxies, and Bedrock still reject every explicit value for these models. Unsupported settings on active LLM slots stop a scan before analysis (exit code 2). Static scans (`--no-llm`) skip provider initialization and control validation. A Bedrock application-inference-profile ARN hides the model name, so declare `sampling: rejected` for it in the model registry. | Optional |
-| `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Other hosted providers and CLI providers do not receive it. Provider support remains model-dependent; `gpt-6.1-sol` receives it, but OpenAI treats `seed` as best-effort, so output can still differ between runs. | Optional |
+| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1`. Unset or blank preserves the endpoint default. `gpt-6.1-sol` and Claude models from the Opus 4.7+, Sonnet 5, Fable 5, Mythos 5, and Haiku 5 families reject explicit temperature on these two provider routes. Static scans skip provider initialization and control validation. | Optional |
+| `SKILLSPECTOR_SEED` | Optional signed 64-bit integer sampling seed. Endpoint and model support is best-effort. | Optional |
 | `SKILLSPECTOR_COMPACT_PROMPTS` | Opt-in compact line numbering in LLM prompts: numbered lines render as `L1:`, `L2:` instead of zero-padded `L01:`, `L02:`. Accepted truthy values are `1`, `true`, and `yes` (case-insensitive; surrounding whitespace is trimmed). Unset or any other value keeps the default zero-padded format. | Optional |
-| `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
-| `ANTHROPIC_BASE_URL` | Override the native Anthropic endpoint (default: `https://api.anthropic.com`). | Optional |
-| `MINIMAX_API_KEY` | Credential for the MiniMax provider (`SKILLSPECTOR_PROVIDER=minimax`). | Required when `SKILLSPECTOR_PROVIDER=minimax` |
-| `MINIMAX_REGION` | MiniMax regional endpoint: `global_en` (default) or `cn_zh`. | Optional |
-| `MINIMAX_BASE_URL` | Override the selected MiniMax regional endpoint. | Optional |
-| `ANTHROPIC_AUTH_SCHEME` | Set to `bearer` to send `ANTHROPIC_API_KEY` as `Authorization: Bearer` instead of `x-api-key`, for gateways exposing the Messages API. | Optional |
-| `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict). | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
-| `ANTHROPIC_PROXY_API_KEY` | Bearer token for the Anthropic proxy provider. | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
-| `ANTHROPIC_PROXY_API_VERSION` | `anthropic_version` value sent in the request body (default: `vertex-2023-10-16`). | Optional |
-| `AWS_PROFILE` | Named AWS profile for the Bedrock provider — authenticates via SigV4 through boto3. When unset, the standard boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
-| `AWS_REGION` | AWS region for the Bedrock Runtime endpoint. Defaults to `us-west-2`. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
-| `OLLAMA_BASE_URL` | Ollama OpenAI-compatible endpoint. Defaults to `http://localhost:11434/v1`. | Optional (used when `SKILLSPECTOR_PROVIDER=ollama`) |
-| `AZURE_OPENAI_API_KEY` | API key for the Azure OpenAI provider. | Required when `SKILLSPECTOR_PROVIDER=azure_openai` |
-| `AZURE_OPENAI_ENDPOINT` | Azure resource endpoint for the Azure OpenAI provider. | Required when `SKILLSPECTOR_PROVIDER=azure_openai` |
-| `AZURE_OPENAI_DEPLOYMENT` | Azure deployment name. Defaults to the selected model label. | Optional |
-| `AZURE_OPENAI_API_VERSION` | Azure OpenAI API version. Defaults to `2024-06-01`. | Optional |
 | `SKILLSPECTOR_COMPAT_API_KEY` | API key for a generic OpenAI-compatible provider. | Required when `SKILLSPECTOR_PROVIDER=openai_compatible` |
 | `SKILLSPECTOR_COMPAT_BASE_URL` | Base URL for a generic OpenAI-compatible provider. | Required when `SKILLSPECTOR_PROVIDER=openai_compatible` |
-| `SKILLSPECTOR_MODEL` | Override the active provider model. For hosted providers, this replaces the bundled default from the LLM Analysis table. For CLI providers, this is forwarded as `--model` instead of using the local runtime fallback. | Optional |
-| `SKILLSPECTOR_MODEL_<SLOT>` | Override the model for one analyzer slot (for example `SKILLSPECTOR_MODEL_META_ANALYZER`). It takes precedence over `SKILLSPECTOR_MODEL`, which in turn replaces provider slot defaults such as the `anthropic` `meta_analyzer` default. See [model provenance](docs/INFERENCE_USAGE.md#model-provenance) for the full precedence. | Optional |
+| `SKILLSPECTOR_COMPAT_HEADERS` | Optional JSON object with string keys and values for compatible gateway requests. | Optional |
+| `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model. | Optional |
+| `SKILLSPECTOR_MODEL_<SLOT>` | Override a single analyzer slot, for example with `SKILLSPECTOR_MODEL_META_ANALYZER`. This takes precedence over `SKILLSPECTOR_MODEL`. See [model provenance](docs/INFERENCE_USAGE.md#model-provenance). | Optional |
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
 | `SKILLSPECTOR_MAX_WORKFLOW_SECONDS` | Aggregate scan deadline in seconds; defaults to `1080` (18 minutes). Accepts a positive finite number. Invalid values warn and retain the default. Set before starting the process; caller-supplied budgets and external tool timeouts still apply. | Optional |
 | `SKILLSPECTOR_TP4_MAX_BATCHES` | Maximum description-behavior review batches per TP4 analyzer execution; defaults to `256`. Accepts an integer from `1` to `4096`. Unset or blank uses the default; invalid values warn and retain it. Set before starting the process; file, byte, finding, concurrency, and workflow-time limits still apply. | Optional |
 | `SKILLSPECTOR_MAX_DEPENDENCY_SOURCE_ANALYSIS_SECONDS` | Ceiling for the dependency-source analysis pass, in seconds. Defaults to `5.0`, which is the historical value. Raise it on slow or heavily loaded machines so the same unchanged tree does not come back partially inspected, which would set `safe_to_install` to false and record `runtime_limit`. The remaining aggregate workflow time (`SKILLSPECTOR_MAX_WORKFLOW_SECONDS`, 1080 seconds by default) still caps the effective value; values above that remaining time have no effect. Invalid, zero, negative, infinite, and NaN values keep the 5-second default. The setting is resolved when the module is imported, so a new process is required after changing it. See [analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md#configuring-the-dependency-source-deadline). | Optional |
-
-> **Disabled provider:** `codex_cli` remains registered but cannot run LLM analysis because its read-only sandbox allows host-file reads. Existing users should select an HTTP API provider or another supported CLI provider.
-
-> **CLI providers** (`claude_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
->
-> `opencode_cli` currently fails closed unless the installed OpenCode version is one of the individually verified releases (`1.18.31`, `1.18.32`, `1.18.33`, `1.18.34`, `1.18.35`, `1.19.0`, `1.19.1`, `1.19.2`, `1.19.3`, `1.19.4`), whose configuration precedence and deny-all semantics are verified by this release; every other version, including prereleases, still fails closed.
 
 ### CLI Options
 
@@ -752,7 +601,7 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
       {
         "node": "semantic_security_discovery",
         "request_kind": "structured_output",
-        "provider": "nv_inference",
+        "provider": "openai_compatible",
         "model": "azure/anthropic/claude-opus-4-6",
         "model_source": "provider_response",
         "usage_source": "provider_response",

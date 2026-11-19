@@ -13,35 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Structured-output strategy shared by the Claude-serving providers.
+"""Model rules for structured output on OpenAI-compatible endpoints.
 
-LangChain's ``with_structured_output`` defaults to ``function_calling``,
-which forces a tool call.  Some Claude models reject a forced tool call
-with HTTP 400 (``tool_choice: type "tool" and "any" are not supported for
-this model``).  What replaces it depends on the platform:
-
-- The direct-API providers request the native JSON-schema response format
-  (``method="json_schema"``) through ``structured_output_method(model)``.
-- Amazon Bedrock has no JSON-schema output for these models (the Converse
-  ``outputConfig`` comes back as ``output_config.format: Extra inputs are
-  not permitted``), so ``BedrockProvider`` leaves ``toolChoice`` at ``auto``
-  and :func:`skillspector.llm_utils.bind_structured_output` asks for the
-  tool call in the prompt and retries when the model answers in prose.
-- OpenAI-compatible gateways serving Claude can turn a ``json_schema``
-  response format into a forced tool call too, so the ``openai`` and
-  ``openai_compatible`` providers bind the schema as a tool with
-  ``tool_choice`` left at ``auto`` and ask for the call in the prompt, as on
-  Bedrock.
-
-  That last shape is also the recovery path for any OpenAI-compatible
-  gateway: when a gateway answers the ``json_schema`` response format with
-  HTTP 400, the analyzers rebind the schema as an unforced tool call
-  (:func:`skillspector.llm_utils.bind_structured_output_fallback`) and retry
-  the batch once, instead of failing every batch on the first shape.
-
-Gateway and Bedrock model IDs namespace or prefix the model name
-(``azure/anthropic/claude-opus-5-5``, ``us.anthropic.claude-opus-5-5``);
-:func:`model_name` reads it back so every route applies the same rules.
+Some Claude models reject forced tool calls. Compatible gateways can also
+translate a JSON-schema response format into a forced call. For these models,
+the providers bind the schema as a tool with automatic tool choice and ask
+for the call in the prompt. The same shape can recover from an HTTP 400
+rejecting JSON-schema output on other compatible endpoints.
 """
 
 from __future__ import annotations
@@ -84,8 +62,7 @@ def model_name(model: str) -> str:
     """Return *model*'s last path segment, lowercased and cut at any ``@`` or ``:``.
 
     ``openai/gpt-6.1-sol:nitro`` and ``azure/anthropic/claude-opus-5-5@20260922``
-    read as ``gpt-6.1-sol`` and ``claude-opus-5-5``; Bedrock's ``:0`` version
-    suffix and ARN prefixes drop the same way.
+    read as ``gpt-6.1-sol`` and ``claude-opus-5-5``.
     """
     return re.split(r"[@:]", model.rpartition("/")[2].lower(), maxsplit=1)[0]
 
@@ -105,18 +82,8 @@ def rejects_forced_tool_call(model: str) -> bool:
     return _names_model(model, FORCED_TOOL_CALL_REJECTED_MODELS)
 
 
-def rejects_sampling_controls(model: str, registry_path: str | None = None) -> bool:
-    """Return ``True`` when *model* rejects ``temperature``.
-
-    ``sampling: rejected`` in the registry at *registry_path* declares it for
-    IDs that hide the model name (a Bedrock application-inference-profile ARN);
-    otherwise the Claude model name read from *model* decides.
-    """
-    if (
-        registry_path is not None
-        and registry.lookup_setting(registry_path, model, "sampling") == "rejected"
-    ):
-        return True
+def rejects_sampling_controls(model: str) -> bool:
+    """Return whether *model* names a Claude model that rejects temperature."""
     return _names_model(model, SAMPLING_REJECTED_MODELS)
 
 
@@ -136,14 +103,8 @@ def forced_tool_choice_supported(model: str, registry_path: str) -> bool:
 def claude_model_name(model: str) -> str | None:
     """Return the bare Claude model name carried by *model*, or ``None``.
 
-    Reads :func:`model_name` (the last path segment, case-insensitively and up
-    to any ``@`` or ``:`` suffix such as ``@20260922``, ``:latest`` or
-    Bedrock's ``:0``), so gateway IDs (``azure/anthropic/claude-opus-5-5``), routing prefixes
-    (``bedrock-claude-opus-5-5``, ``us.anthropic.claude-opus-5-5``), Bedrock
-    foundation-model and inference-profile ARNs, and dotted versions
-    (``claude-opus-5.5``) all resolve to ``claude-opus-5-5``.  Returns ``None``
-    for identifiers that do not name the model, such as Bedrock
-    application-inference-profile ARNs; declare those in the registry.
+    Recognizes gateway labels such as ``azure/anthropic/claude-opus-5-5``
+    and normalizes dotted versions such as ``claude-opus-5.5``.
     """
     match = _CLAUDE_MODEL_NAME.search(model_name(model))
     return _DOTTED_VERSION.sub("-", match.group(1)) if match else None

@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -27,19 +27,6 @@ from skillspector.constants import DEFAULT_CONTEXT_LENGTH, MAX_INPUT_TOKENS_PCT
 from skillspector.providers import reset_provider, use_provider
 
 MODULE = "skillspector.model_info"
-NV_PROVIDER_MODULE = "skillspector.providers.nv_inference.provider"
-
-try:
-    import skillspector.providers.nv_inference.provider  # noqa: F401
-
-    _NV_PROVIDER_AVAILABLE = True
-except ImportError:
-    _NV_PROVIDER_AVAILABLE = False
-
-nv_provider_required = pytest.mark.skipif(
-    not _NV_PROVIDER_AVAILABLE,
-    reason="optional NVIDIA metadata provider not present (public-OSS build)",
-)
 
 
 def _clear_caches() -> None:
@@ -84,90 +71,12 @@ def _get_real_functions():
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — NVIDIA metadata API
+# YAML registry (via SKILLSPECTOR_MODEL_REGISTRY env var)
 # ---------------------------------------------------------------------------
 
 
-@nv_provider_required
-class TestLayer1NvidiaApi:
-    """Layer 1: NVIDIA catalog API resolution."""
-
-    def test_layer1_success(self) -> None:
-        """When NVIDIA_INFERENCE_METADATA_KEY is set and API succeeds, use that value."""
-        mod = _get_real_functions()
-
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = [{"context_length_tokens": 500_000}]
-        mock_resp.raise_for_status = MagicMock()
-
-        with (
-            patch.dict("os.environ", {"NVIDIA_INFERENCE_METADATA_KEY": "test-key"}, clear=False),
-            patch(f"{NV_PROVIDER_MODULE}.requests.get", return_value=mock_resp),
-        ):
-            result = mod._resolve_context_length("some/model")
-            assert result == 500_000
-
-    def test_layer1_failure_falls_to_layer2(self, tmp_path: Path) -> None:
-        """When API fails, fall through to Layer 2 registry."""
-        mod = _get_real_functions()
-
-        registry_file = tmp_path / "registry.yaml"
-        _write_registry(
-            registry_file,
-            {
-                "some/model": {"context_length": 256_000},
-            },
-        )
-
-        with (
-            patch.dict(
-                "os.environ",
-                {
-                    "NVIDIA_INFERENCE_METADATA_KEY": "test-key",
-                    "SKILLSPECTOR_MODEL_REGISTRY": str(registry_file),
-                },
-                clear=False,
-            ),
-            patch(f"{NV_PROVIDER_MODULE}.requests.get", side_effect=Exception("network down")),
-        ):
-            result = mod._resolve_context_length("some/model")
-            assert result == 256_000
-
-    def test_layer1_skipped_when_key_absent(self, tmp_path: Path) -> None:
-        """When NVIDIA_INFERENCE_METADATA_KEY is not set, skip straight to Layer 2."""
-        mod = _get_real_functions()
-
-        registry_file = tmp_path / "registry.yaml"
-        _write_registry(
-            registry_file,
-            {
-                "some/model": {"context_length": 300_000},
-            },
-        )
-
-        with (
-            patch.dict(
-                "os.environ",
-                {
-                    "NVIDIA_INFERENCE_METADATA_KEY": "",
-                    "SKILLSPECTOR_MODEL_REGISTRY": str(registry_file),
-                },
-                clear=False,
-            ),
-            patch(f"{NV_PROVIDER_MODULE}.requests.get") as mock_get,
-        ):
-            result = mod._resolve_context_length("some/model")
-            assert result == 300_000
-            mock_get.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Layer 2 — YAML registry (via SKILLSPECTOR_MODEL_REGISTRY env var)
-# ---------------------------------------------------------------------------
-
-
-class TestLayer2Registry:
-    """Layer 2: YAML registry resolution via env var."""
+class TestRegistry:
+    """YAML registry resolution via env var."""
 
     def test_registry_lookup(self, tmp_path: Path) -> None:
         """Model found in registry file pointed to by env var."""
@@ -184,7 +93,6 @@ class TestLayer2Registry:
         with patch.dict(
             "os.environ",
             {
-                "NVIDIA_INFERENCE_METADATA_KEY": "",
                 "SKILLSPECTOR_MODEL_REGISTRY": str(registry_file),
             },
             clear=False,
@@ -207,7 +115,6 @@ class TestLayer2Registry:
         with patch.dict(
             "os.environ",
             {
-                "NVIDIA_INFERENCE_METADATA_KEY": "",
                 "SKILLSPECTOR_MODEL_REGISTRY": str(registry_file),
             },
             clear=False,
@@ -221,7 +128,7 @@ class TestLayer2Registry:
 
         with patch.dict(
             "os.environ",
-            {"NVIDIA_INFERENCE_METADATA_KEY": "", "SKILLSPECTOR_MODEL_REGISTRY": ""},
+            {"SKILLSPECTOR_MODEL_REGISTRY": ""},
             clear=False,
         ):
             result = mod._resolve_context_length("any/model")
@@ -234,7 +141,6 @@ class TestLayer2Registry:
         with patch.dict(
             "os.environ",
             {
-                "NVIDIA_INFERENCE_METADATA_KEY": "",
                 "SKILLSPECTOR_MODEL_REGISTRY": "/nonexistent/path.yaml",
             },
             clear=False,
@@ -249,7 +155,7 @@ class TestLayer2Registry:
 
 
 class TestFallback:
-    """Fallback when neither layer resolves."""
+    """Fallback when a model is absent from the registry."""
 
     def test_unknown_model_returns_default(self, tmp_path: Path) -> None:
         """Unknown model falls back to DEFAULT_CONTEXT_LENGTH with a warning."""
@@ -266,7 +172,6 @@ class TestFallback:
         with patch.dict(
             "os.environ",
             {
-                "NVIDIA_INFERENCE_METADATA_KEY": "",
                 "SKILLSPECTOR_MODEL_REGISTRY": str(registry_file),
             },
             clear=False,
@@ -297,7 +202,6 @@ class TestPublicApi:
         with patch.dict(
             "os.environ",
             {
-                "NVIDIA_INFERENCE_METADATA_KEY": "",
                 "SKILLSPECTOR_MODEL_REGISTRY": str(registry_file),
             },
             clear=False,
@@ -320,7 +224,6 @@ class TestPublicApi:
         with patch.dict(
             "os.environ",
             {
-                "NVIDIA_INFERENCE_METADATA_KEY": "",
                 "SKILLSPECTOR_MODEL_REGISTRY": str(registry_file),
             },
             clear=False,
@@ -345,7 +248,6 @@ class TestPublicApi:
         with patch.dict(
             "os.environ",
             {
-                "NVIDIA_INFERENCE_METADATA_KEY": "",
                 "SKILLSPECTOR_MODEL_REGISTRY": str(registry_file),
             },
             clear=False,
@@ -353,6 +255,22 @@ class TestPublicApi:
             result = mod.get_max_output_tokens("bare/model")
             expected = int(200_000 * (1 - MAX_INPUT_TOKENS_PCT))
             assert result == expected
+
+    def test_unconfigured_compatible_provider_uses_openai_registry_for_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai_compatible")
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy-key")
+        for key in (
+            "SKILLSPECTOR_COMPAT_API_KEY",
+            "SKILLSPECTOR_COMPAT_BASE_URL",
+            "SKILLSPECTOR_MODEL_REGISTRY",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        mod = _get_real_functions()
+
+        assert mod.get_max_input_tokens("gpt-5.4") == 787_500
+        assert mod.get_max_output_tokens("gpt-5.4") == 128_000
 
     def test_token_limits_follow_current_bound_provider_for_same_model_label(self) -> None:
         """Same labels must resolve against the provider bound in this context."""

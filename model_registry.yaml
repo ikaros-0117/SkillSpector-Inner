@@ -1,8 +1,8 @@
 # Model registry — context window and output token limits.
 #
 # Point SKILLSPECTOR_MODEL_REGISTRY at this file (or your own) so the tool
-# knows each model's token budget.  This is the fallback when the dynamic
-# metadata API is unavailable (e.g. open-source deployments).
+# knows each custom gateway model's token budget. This file replaces the
+# selected provider's bundled model registry.
 #
 # Format:
 #   models:

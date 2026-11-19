@@ -31,46 +31,13 @@ LLM_ANALYZER_SLOTS = (
     "meta_analyzer",
 )
 
-_TEMPERATURE_ADAPTERS = frozenset(
-    {
-        "anthropic",
-        "anthropic_proxy",
-        "azure_openai",
-        "bedrock",
-        "minimax",
-        "nv_build",
-        "nv_inference",
-        "ollama",
-        "openai",
-        "openai_compatible",
-    }
-)
-_SEED_ADAPTERS = frozenset(
-    {"azure_openai", "minimax", "nv_build", "nv_inference", "ollama", "openai", "openai_compatible"}
-)
-_REASONING_EFFORT_ADAPTERS = frozenset(
-    {
-        "anthropic",
-        "anthropic_proxy",
-        "minimax",
-        "nv_build",
-        "nv_inference",
-        "ollama",
-        "openai",
-        "openai_compatible",
-    }
-)
+_OPENAI_ADAPTERS = frozenset({"openai", "openai_compatible"})
 _SAFE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,255}")
-_SAFE_DEPLOYMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]{0,255}")
-_SAFE_API_VERSION = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:-preview)?")
 _MAX_SAFE_SEED = MAX_SAMPLING_SEED
 _MIN_SAFE_SEED = MIN_SAMPLING_SEED
 _CONTROL_SOURCES = frozenset(
     {"environment", "provider_default", "unset", "invalid_environment", "out_of_range", "unknown"}
 )
-_DEPLOYMENT_SOURCES = frozenset({"environment", "resolved_model", "not_applicable", "unknown"})
-_API_VERSION_SOURCES = frozenset({"environment", "provider_default", "not_applicable", "unknown"})
-_AZURE_OPENAI_DEFAULT_API_VERSION = "2024-06-01"
 _SOURCE_REVISION = re.compile(r"[0-9a-fA-F]{7,64}")
 _SOURCE_REVISION_SOURCES = frozenset({"build_environment", "package_vcs_metadata", "unknown"})
 
@@ -94,18 +61,6 @@ def _safe_optional_label(value: object) -> str | None:
     return label or None
 
 
-def _safe_deployment(value: object) -> str | None:
-    """Deployment names have a narrower alphabet than namespaced model IDs."""
-    candidate = _safe_optional_label(value)
-    return candidate if candidate and _SAFE_DEPLOYMENT.fullmatch(candidate) else None
-
-
-def _safe_api_version(value: object) -> str | None:
-    """Azure API versions are dates with an optional preview suffix."""
-    candidate = value.strip() if isinstance(value, str) else ""
-    return candidate if _SAFE_API_VERSION.fullmatch(candidate) else None
-
-
 def _capture_source_revision() -> tuple[str, str]:
     """Return an injected/packaged VCS identity without invoking Git."""
     injected = os.environ.get("SKILLSPECTOR_BUILD_REVISION", "").strip()
@@ -123,36 +78,6 @@ def _capture_source_revision() -> tuple[str, str]:
     if isinstance(packaged, str) and _SOURCE_REVISION.fullmatch(packaged.strip()):
         return packaged.strip().lower(), "package_vcs_metadata"
     return "unknown", "unknown"
-
-
-def _capture_provider_routing(resolved_adapter: str) -> dict[str, object]:
-    """Capture non-secret provider routing inputs used by client construction."""
-    if resolved_adapter != "azure_openai":
-        return {
-            "deployment_override": None,
-            "deployment_source": "not_applicable",
-            "api_version": None,
-            "api_version_source": "not_applicable",
-        }
-
-    raw_deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "").strip()
-    deployment = _safe_deployment(raw_deployment)
-    raw_api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "").strip()
-    api_version = _safe_api_version(raw_api_version or _AZURE_OPENAI_DEFAULT_API_VERSION)
-    return {
-        "deployment_override": deployment,
-        "deployment_source": (
-            "environment" if deployment else "unknown" if raw_deployment else "resolved_model"
-        ),
-        "api_version": api_version,
-        "api_version_source": (
-            "environment"
-            if raw_api_version and api_version
-            else "unknown"
-            if raw_api_version
-            else "provider_default"
-        ),
-    }
 
 
 def _requested_temperature(raw: str) -> tuple[float | None, str]:
@@ -216,7 +141,6 @@ def capture_llm_provenance(model_config: Mapping[str, object]) -> dict[str, obje
         model_config,
         configured_adapter=configured_adapter,
         resolved_adapter=resolved_adapter,
-        routing_adapter=resolved_adapter,
     )
 
 
@@ -236,7 +160,6 @@ def capture_static_llm_provenance(
         model_config,
         configured_adapter=configured_adapter or "unknown",
         resolved_adapter="unknown",
-        routing_adapter=configured_adapter,
     )
 
 
@@ -245,7 +168,6 @@ def _capture_llm_provenance(
     *,
     configured_adapter: str,
     resolved_adapter: str,
-    routing_adapter: str,
 ) -> dict[str, object]:
     """Build a sanitized capture from already selected configuration labels."""
     package_version = version("skillspector")
@@ -279,17 +201,17 @@ def _capture_llm_provenance(
         "temperature": _control(
             temperature,
             temperature_source,
-            adapter_support=resolved_adapter in _TEMPERATURE_ADAPTERS,
+            adapter_support=resolved_adapter in _OPENAI_ADAPTERS,
         ),
         "seed": _control(
             seed,
             seed_source,
-            adapter_support=resolved_adapter in _SEED_ADAPTERS,
+            adapter_support=resolved_adapter in _OPENAI_ADAPTERS,
         ),
         "reasoning_effort": _control(
             effort,
             effort_source,
-            adapter_support=resolved_adapter in _REASONING_EFFORT_ADAPTERS,
+            adapter_support=resolved_adapter in _OPENAI_ADAPTERS,
         ),
     }
     return {
@@ -297,7 +219,7 @@ def _capture_llm_provenance(
         "provider": {
             "configured_adapter": _safe_label(configured_adapter),
             "resolved_adapter": _safe_label(resolved_adapter),
-            "routing": _capture_provider_routing(routing_adapter),
+            "routing": _provider_routing(resolved_adapter),
             "service": "unknown",
         },
         "analyzers": analyzers,
@@ -357,14 +279,7 @@ def _sanitize_control(
     adapter_support = raw.get("adapter_support")
     adapter_support = adapter_support if isinstance(adapter_support, bool) else False
     if effective_adapters:
-        supported_adapters = (
-            _TEMPERATURE_ADAPTERS
-            if name == "temperature"
-            else _SEED_ADAPTERS
-            if name == "seed"
-            else _REASONING_EFFORT_ADAPTERS
-        )
-        adapter_support = all(adapter in supported_adapters for adapter in effective_adapters)
+        adapter_support = all(adapter in _OPENAI_ADAPTERS for adapter in effective_adapters)
 
     raw_requested = raw.get("requested")
     requested = raw_requested
@@ -451,47 +366,14 @@ def _sanitize_control(
     }
 
 
-def _sanitize_provider_routing(value: object, *, resolved_adapter: str) -> dict[str, object]:
-    """Return the fixed routing contract without endpoints or credentials."""
-    if resolved_adapter == "unknown":
-        return {
-            "deployment_override": None,
-            "deployment_source": "unknown",
-            "api_version": None,
-            "api_version_source": "unknown",
-        }
-    if resolved_adapter != "azure_openai":
-        return {
-            "deployment_override": None,
-            "deployment_source": "not_applicable",
-            "api_version": None,
-            "api_version_source": "not_applicable",
-        }
-
-    raw = value if isinstance(value, Mapping) else {}
-    deployment = _safe_deployment(raw.get("deployment_override"))
-    deployment_source = raw.get("deployment_source")
-    if not isinstance(deployment_source, str) or deployment_source not in _DEPLOYMENT_SOURCES:
-        deployment_source = "unknown"
-    if deployment_source == "environment" and deployment is None:
-        deployment_source = "unknown"
-    elif deployment_source != "environment":
-        deployment = None
-
-    api_version = _safe_api_version(raw.get("api_version"))
-    api_version_source = raw.get("api_version_source")
-    if not isinstance(api_version_source, str) or api_version_source not in _API_VERSION_SOURCES:
-        api_version_source = "unknown"
-    if api_version_source in {"environment", "provider_default"} and api_version is None:
-        api_version_source = "unknown"
-    elif api_version_source not in {"environment", "provider_default"}:
-        api_version = None
-
+def _provider_routing(resolved_adapter: str) -> dict[str, object]:
+    """Keep the report's routing fields for adapters without deployment settings."""
+    source = "not_applicable" if resolved_adapter in _OPENAI_ADAPTERS else "unknown"
     return {
-        "deployment_override": deployment,
-        "deployment_source": deployment_source,
-        "api_version": api_version,
-        "api_version_source": api_version_source,
+        "deployment_override": None,
+        "deployment_source": source,
+        "api_version": None,
+        "api_version_source": source,
     }
 
 
@@ -533,15 +415,9 @@ def _observed_controls(
 
 def _expected_observed_controls(effective_adapters: Sequence[str]) -> set[str]:
     """Return controls whose constructor state is observable for all adapters."""
-    expected: set[str] = set()
-    for name, supported in (
-        ("temperature", _TEMPERATURE_ADAPTERS),
-        ("seed", _SEED_ADAPTERS),
-        ("reasoning_effort", _REASONING_EFFORT_ADAPTERS),
-    ):
-        if effective_adapters and all(adapter in supported for adapter in effective_adapters):
-            expected.add(name)
-    return expected
+    if effective_adapters and all(adapter in _OPENAI_ADAPTERS for adapter in effective_adapters):
+        return {"temperature", "seed", "reasoning_effort"}
+    return set()
 
 
 def sanitize_llm_provenance(
@@ -568,11 +444,6 @@ def sanitize_llm_provenance(
         else "mixed"
         if effective_adapters
         else "unknown"
-    )
-    routing_adapter = (
-        "azure_openai"
-        if not use_llm and resolved_adapter == "unknown" and configured_adapter == "azure_openai"
-        else resolved_adapter
     )
 
     raw_analyzers = raw.get("analyzers")
@@ -676,9 +547,7 @@ def sanitize_llm_provenance(
             "effective_adapter": effective_adapter,
             "effective_adapters": effective_adapters,
             "service": "unknown",
-            "routing": _sanitize_provider_routing(
-                provider.get("routing"), resolved_adapter=routing_adapter
-            ),
+            "routing": _provider_routing(resolved_adapter),
         },
         "analyzers": analyzers,
         "sampling": sanitized_sampling,

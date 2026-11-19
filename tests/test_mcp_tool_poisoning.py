@@ -39,7 +39,6 @@ from skillspector.inspection_ledger import (
     finalize_ledger,
 )
 from skillspector.llm_analyzer_base import BatchExecutionResult, BatchFailure, LLMAnalyzerBase
-from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.nodes.analyzers import mcp_tool_poisoning
 from skillspector.nodes.deduplicate import deduplicate
 
@@ -1684,9 +1683,7 @@ class TestTP4Fallbacks:
         mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-opus-5")
         assert bindings[-1] == {"method": "json_schema", "include_raw": True, "strict": True}
 
-    @pytest.mark.parametrize(
-        "provider", ["openai_compatible", "nv_inference", "azure_openai", "nv_build"]
-    )
+    @pytest.mark.parametrize("provider", ["openai_compatible"])
     def test_opus5_tp4_does_not_force_tool_output_on_other_providers(
         self, monkeypatch: pytest.MonkeyPatch, patch_openai_chat_model, provider
     ) -> None:
@@ -1889,57 +1886,6 @@ class TestTP4Fallbacks:
         assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
         assert result["analyzer_status_events"][0]["status"] == "completed"
 
-    def test_bedrock_forced_tool_call_answered_in_prose_is_retried(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Bedrock's tool parser returns None for a reply with no tool call (#843)."""
-        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
-        from langchain_aws import ChatBedrockConverse
-        from langchain_core.messages import AIMessage
-        from langchain_core.outputs import ChatGeneration, ChatResult
-
-        from skillspector import llm_utils
-        from skillspector.providers.bedrock import (
-            BEDROCK_DEFAULT_MODEL,
-            BEDROCK_DEFAULT_REGION,
-            BedrockProvider,
-        )
-
-        assert BedrockProvider().forced_tool_choice_supported(BEDROCK_DEFAULT_MODEL)
-        calls = []
-
-        async def answer_in_prose(*_args, **_kwargs):
-            calls.append(1)
-            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="refused"))])
-
-        monkeypatch.setattr(ChatBedrockConverse, "_agenerate", answer_in_prose)
-        monkeypatch.setattr(llm_utils, "get_active_provider", BedrockProvider)
-        monkeypatch.setattr(
-            "skillspector.llm_analyzer_base.get_chat_model",
-            lambda **kwargs: ChatBedrockConverse(
-                model=kwargs["model"],
-                client=MagicMock(),
-                bedrock_client=MagicMock(),
-                region_name=BEDROCK_DEFAULT_REGION,
-            ),
-        )
-        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
-        state = _make_state("mcp_mismatched_skill", use_llm=True)
-        state["model_config"] = {"default": BEDROCK_DEFAULT_MODEL}
-
-        result = node(state)
-
-        assert len(calls) == 4
-        assert result["analyzer_status_events"][0]["status"] == "degraded"
-        assert any(
-            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
-            and event.get("error_class") == "ValidationError"
-            for event in result["inspection_ledger"]
-        )
-        assert not any(
-            event["outcome"] is LedgerOutcome.FAILED for event in result["inspection_ledger"]
-        )
-
     def test_opus5_function_calling_refusal_stays_incomplete(
         self, monkeypatch: pytest.MonkeyPatch, patch_openai_chat_model
     ) -> None:
@@ -1982,23 +1928,6 @@ class TestTP4Fallbacks:
         sleep.assert_called_once_with(0.5)
         assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
         assert result["analyzer_status_events"][0]["status"] == "completed"
-
-    def test_cli_parse_error_is_retried(self, monkeypatch: pytest.MonkeyPatch):
-        state = _make_state("mcp_mismatched_skill", use_llm=True)
-        sleep = AsyncMock()
-        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", sleep)
-        provider = MagicMock()
-        provider.complete.side_effect = ["not JSON", '{"is_mismatch": false}']
-        monkeypatch.setattr(
-            "skillspector.llm_analyzer_base.get_chat_model",
-            lambda **kwargs: AgentCLIChatModel(provider, kwargs["model"], 1024),
-        )
-
-        result = node(state)
-
-        assert provider.complete.call_count == 2
-        sleep.assert_called_once_with(0.5)
-        assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
 
     def test_out_of_range_confidence_is_retried(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)

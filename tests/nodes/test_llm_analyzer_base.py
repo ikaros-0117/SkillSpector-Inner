@@ -27,29 +27,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from anthropic import (
-    APITimeoutError as AnthropicAPITimeoutError,
-)
-from anthropic import (
-    InternalServerError as AnthropicInternalServerError,
-)
-from anthropic import (
-    RateLimitError as AnthropicRateLimitError,
-)
-from botocore.exceptions import (
-    ClientError,
-    HTTPClientError,
-    ProxyConnectionError,
-    ResponseStreamingError,
-    SSLError,
-)
-from botocore.exceptions import (
-    ConnectionError as BotocoreConnectionError,
-)
-from google.auth.exceptions import RefreshError
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain_openai.chat_models._client_utils import _cached_async_httpx_client
 from openai import (
     APITimeoutError as OpenAIAPITimeoutError,
@@ -65,7 +44,6 @@ from pydantic import ValidationError
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import (
     API_CONNECTION_MAX_RETRIES,
-    DEFAULT_CLI_MAX_LLM_CONCURRENCY,
     DEFAULT_MAX_LLM_CONCURRENCY,
     OUTPUT_LANGUAGE_MAX_LENGTH,
     PROVIDER_RETRY_AFTER_MAX_SECONDS,
@@ -82,7 +60,6 @@ from skillspector.llm_analyzer_base import (
     _provider_retry_delay,
     _shared_limiter,
     _StructuredResponseValidationError,
-    _uses_native_connection_retries,
     append_output_language_instruction,
     chunk_file_by_lines,
     estimate_tokens,
@@ -94,9 +71,7 @@ from skillspector.llm_analyzer_base import (
     resolve_output_language,
 )
 from skillspector.llm_utils import (
-    AgentCLIChatModel,
     StructuredOutputParseError,
-    _StructuredAgentCLIModel,
     run_async,
 )
 from skillspector.models import Finding
@@ -106,7 +81,6 @@ from skillspector.nodes.meta_analyzer import (
     MetaAnalyzerResult,
     _format_findings_for_prompt,
 )
-from skillspector.providers._agent_cli import MAX_INPUT_BYTES
 
 # ---------------------------------------------------------------------------
 # estimate_tokens
@@ -139,16 +113,6 @@ class TestResolveMaxConcurrency:
     def test_below_one_clamps_to_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "0")
         assert resolve_max_concurrency() == 1
-
-    def test_cli_provider_unset_uses_cli_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", raising=False)
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
-        assert resolve_max_concurrency() == DEFAULT_CLI_MAX_LLM_CONCURRENCY
-
-    def test_cli_provider_explicit_value_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
-        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "6")
-        assert resolve_max_concurrency() == 6
 
     def test_unknown_provider_uses_http_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", raising=False)
@@ -390,7 +354,7 @@ class APIConnectionError(Exception):
 
 
 class InternalServerError(Exception):
-    """Test double matching OpenAI and Anthropic transient server failures."""
+    """Test double matching transient provider server failures."""
 
 
 class OpenAIContextOverflowError(Exception):
@@ -410,7 +374,6 @@ def _status_error(
     *,
     retry_after: str | None = None,
     retry_after_ms: str | None = None,
-    aws_retry_after: str | None = None,
     should_retry: str | None = None,
 ) -> Exception:
     """Build a provider-neutral status exception with an httpx response."""
@@ -419,27 +382,11 @@ def _status_error(
         headers["retry-after"] = retry_after
     if retry_after_ms is not None:
         headers["retry-after-ms"] = retry_after_ms
-    if aws_retry_after is not None:
-        headers["x-amz-retry-after"] = aws_retry_after
     if should_retry is not None:
         headers["x-should-retry"] = should_retry
     response = _http_response(status_code, headers=headers)
-    error = Exception(f"provider returned {status_code}")
-    error.response = response  # type: ignore[attr-defined]
-    return error
-
-
-def _bedrock_error(
-    code: str, status_code: int = 400, *, retry_after: str | None = None
-) -> ClientError:
-    """Build the public botocore shape returned by Bedrock Runtime."""
-    headers = {"retry-after": retry_after} if retry_after is not None else {}
-    return ClientError(
-        {
-            "Error": {"Code": code, "Message": "provider detail"},
-            "ResponseMetadata": {"HTTPStatusCode": status_code, "HTTPHeaders": headers},
-        },
-        "Converse",
+    return httpx.HTTPStatusError(
+        f"provider returned {status_code}", request=response.request, response=response
     )
 
 
@@ -456,23 +403,9 @@ class TestTransientProviderErrors:
             ),
             OpenAIRateLimitError("rate limited", response=_http_response(429), body=None),
             OpenAIAPITimeoutError(httpx.Request("POST", "https://provider.test/v1/chat")),
-            AnthropicInternalServerError(
-                "provider returned 500", response=_http_response(500), body=None
-            ),
-            AnthropicRateLimitError("rate limited", response=_http_response(429), body=None),
-            AnthropicAPITimeoutError(httpx.Request("POST", "https://provider.test/v1/chat")),
-            BotocoreConnectionError(error="connection reset"),
-            ProxyConnectionError(proxy_url="https://proxy.test"),
-            HTTPClientError(error="connection reset"),
-            ResponseStreamingError(error="stream interrupted"),
-            SSLError(endpoint_url="https://bedrock.test", error="TLS handshake failed"),
             _status_error(408),
             _status_error(429),
             _status_error(503),
-            _bedrock_error("ThrottlingException"),
-            _bedrock_error("RequestTimeout"),
-            _bedrock_error("RequestTimeoutException"),
-            _bedrock_error("ServiceUnavailableException"),
         ],
     )
     def test_classifies_supported_transient_shapes(self, error: BaseException) -> None:
@@ -484,7 +417,6 @@ class TestTransientProviderErrors:
             ValueError("invalid model"),
             _status_error(400),
             _status_error(401),
-            _bedrock_error("ValidationException"),
             OpenAIContextOverflowError("input exceeds model context window"),
         ],
     )
@@ -522,16 +454,6 @@ class TestTransientProviderErrors:
 
         assert _provider_retry_delay(error, 0) == 17.5
 
-    def test_malformed_standard_hints_fall_back_to_aws_header(self) -> None:
-        error = _status_error(
-            429,
-            retry_after="invalid",
-            retry_after_ms="invalid",
-            aws_retry_after="7",
-        )
-
-        assert _provider_retry_delay(error, 0) == 12.0
-
     def test_uses_http_date_retry_after(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("skillspector.llm_analyzer_base.time.time", lambda: 0.0)
 
@@ -542,21 +464,11 @@ class TestTransientProviderErrors:
             == 17.0
         )
 
-    def test_uses_provider_retry_after_for_bedrock_responses(self) -> None:
-        error = _bedrock_error("ThrottlingException", retry_after="7")
-
-        assert _provider_retry_delay(error, 0) == 12.0
-
     def test_caps_provider_retry_after(self) -> None:
         assert (
             _provider_retry_delay(_status_error(429, retry_after="3600"), 0)
             == PROVIDER_RETRY_AFTER_MAX_SECONDS
         )
-
-    def test_bedrock_uses_coordinator_instead_of_native_retries(self) -> None:
-        chat_model = type("ChatBedrockConverse", (), {})()
-
-        assert not _uses_native_connection_retries(chat_model, max_retries=0)
 
 
 class TestProviderRetryJitter:
@@ -583,7 +495,7 @@ class TestProviderRetryJitter:
             "skillspector.llm_analyzer_base.uniform",
             lambda low, high: low + fraction * (high - low),
         )
-        error = _bedrock_error("ThrottlingException", retry_after=str(requested))
+        error = _status_error(429, retry_after=str(requested))
 
         for attempt in range(3):
             delay = _provider_retry_delay(error, attempt)
@@ -600,7 +512,7 @@ class TestProviderRetryJitter:
             "skillspector.llm_analyzer_base.uniform",
             lambda low, high: low + next(fractions) * (high - low),
         )
-        error = _bedrock_error("ThrottlingException", retry_after="7")
+        error = _status_error(429, retry_after="7")
 
         assert _provider_retry_delay(error, 0) == 8.25
         assert _provider_retry_delay(error, 0) == 10.75
@@ -615,7 +527,7 @@ class TestProviderRetryJitter:
             "skillspector.llm_analyzer_base.uniform", lambda low, high: (low + high) / 2
         )
         analyzer = LLMAnalyzerBase(base_prompt="test", model="nvidia/openai/gpt-oss-120b")
-        error = _bedrock_error("ThrottlingException", retry_after=retry_after)
+        error = _status_error(429, retry_after=retry_after)
         batch = Batch(file_path="a.py", content="code")
         invoke = AsyncMock(side_effect=error) if async_mode else MagicMock(side_effect=error)
         sleep = AsyncMock() if async_mode else MagicMock()
@@ -624,7 +536,7 @@ class TestProviderRetryJitter:
             analyzer, "_asleep_before_retry" if async_mode else "_sleep_before_retry", sleep
         )
 
-        with pytest.raises(ClientError) as caught:
+        with pytest.raises(httpx.HTTPStatusError) as caught:
             if async_mode:
                 await analyzer._ainvoke_batch_with_retries(batch, "test")
             else:
@@ -648,7 +560,7 @@ class TestProviderRetryJitter:
         analyzer = LLMAnalyzerBase(
             base_prompt="test", model="nvidia/openai/gpt-oss-120b", timeout=lambda: remaining
         )
-        error = _bedrock_error("ThrottlingException", retry_after="6")
+        error = _status_error(429, retry_after="6")
         batch = Batch(file_path="a.py", content="code")
         mock_type = AsyncMock if async_mode else MagicMock
         invoke = mock_type(side_effect=[error, (batch, [])])
@@ -664,7 +576,7 @@ class TestProviderRetryJitter:
             return analyzer._invoke_batch_with_retries(batch, "test")
 
         if remaining <= 8.5:
-            with pytest.raises(ClientError) as caught:
+            with pytest.raises(httpx.HTTPStatusError) as caught:
                 await run()
             assert caught.value is error
             assert invoke.call_count == 1
@@ -1080,133 +992,6 @@ class TestMetaAnalyzerResultFindingsValidator:
 
 
 # ---------------------------------------------------------------------------
-# LLMAnalyzerBase.get_batches — CLI provider input byte cap
-# ---------------------------------------------------------------------------
-
-
-class TestCliPromptByteBudget:
-    """CLI providers reject prompts over ``MAX_INPUT_BYTES`` before the CLI starts.
-
-    The token budget alone does not keep a numbered prompt under that cap: with a
-    272k-token context window (input budget 204k tokens), short lines carry a
-    line-number prefix the token estimate ignores, and multi-byte text is larger in
-    bytes than in estimated tokens.
-    """
-
-    MODEL = "nvidia/openai/gpt-oss-120b"
-    LARGE_CONTEXT_INPUT_BUDGET = int(272_000 * 0.75)
-
-    @pytest.fixture
-    def cli_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
-
-    @pytest.fixture
-    def http_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
-
-    def _analyzer(self) -> LLMAnalyzerBase:
-        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
-        analyzer._input_budget = self.LARGE_CONTEXT_INPUT_BUDGET
-        return analyzer
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_cli_provider_batches_fit_max_input_bytes(self, cli_provider: None) -> None:
-        analyzer = self._analyzer()
-        content = "".join("z" * 10 + "\n" for _ in range(150_000))
-        batches = analyzer.get_batches(["big.js"], {"big.js": content})
-        assert len(batches) > 1
-        for batch in batches:
-            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_cli_provider_batches_cover_every_line(self, cli_provider: None) -> None:
-        analyzer = self._analyzer()
-        content = "".join("z" * 10 + "\n" for _ in range(150_000))
-        covered: set[int] = set()
-        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
-            assert batch.end_line is not None
-            covered.update(range(batch.start_line, batch.end_line + 1))
-        assert covered == set(range(1, 150_001))
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_cli_provider_splits_multibyte_file_under_token_budget(
-        self, cli_provider: None
-    ) -> None:
-        analyzer = self._analyzer()
-        # ~1.2 MB of UTF-8 but only ~100k estimated tokens: fits the token budget whole.
-        content = "".join("漢" * 200 + "\n" for _ in range(2_000))
-        assert estimate_tokens(content) <= self.LARGE_CONTEXT_INPUT_BUDGET
-        batches = analyzer.get_batches(["cjk.md"], {"cjk.md": content})
-        assert len(batches) > 1
-        for batch in batches:
-            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_http_provider_serialized_prompts_fit_and_keep_all_lines(
-        self, http_provider: None
-    ) -> None:
-        analyzer = self._analyzer()
-        content = "".join("z" * 10 + "\n" for _ in range(150_000))
-        covered: set[int] = set()
-        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
-            prompt = analyzer.build_prompt(batch)
-            if analyzer.response_schema is not None:
-                from skillspector.llm_utils import structured_output_instructions
-
-                prompt += structured_output_instructions(analyzer.response_schema)
-            assert (len(prompt.encode("utf-8")) + 3) // 4 <= analyzer._input_budget
-            assert batch.end_line is not None
-            covered.update(range(batch.start_line, batch.end_line + 1))
-        assert covered == set(range(1, 150_001))
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_cli_payload_with_schema_instructions_fits_without_margin(
-        self, cli_provider: None, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # The CLI transport appends the JSON schema after build_prompt; the budget must
-        # measure it rather than rely on the safety margin to absorb it.
-        monkeypatch.setattr("skillspector.llm_analyzer_base.PROMPT_BYTE_SAFETY_MARGIN", 0)
-        analyzer = self._analyzer()
-        structured = _StructuredAgentCLIModel(MagicMock(), LLMAnalysisResult)
-        content = "".join("z" * 10 + "\n" for _ in range(150_000))
-        for batch in analyzer.get_batches(["big.js"], {"big.js": content}):
-            payload = structured._augment(analyzer.build_prompt(batch))
-            assert len(payload.encode("utf-8")) <= MAX_INPUT_BYTES
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_cli_path_with_unencodable_characters_does_not_raise(self, cli_provider: None) -> None:
-        # A non-UTF-8 file name decoded with surrogateescape; the provider encodes
-        # with errors="replace", so batching must not be stricter than the transport.
-        analyzer = self._analyzer()
-        path = "skill/\udcff.md"
-        batches = analyzer.get_batches([path], {path: "line \udcfe\n"})
-        assert [b.file_path for b in batches] == [path]
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_oversized_single_line_is_fragmented_without_truncation(
-        self, cli_provider: None
-    ) -> None:
-        analyzer = self._analyzer()
-        # Fewer estimated tokens than the budget, more bytes than the cap.
-        line = "漢" * (MAX_INPUT_BYTES // 3 + 10)
-        batches = analyzer.get_batches(["min.js"], {"min.js": line + "\n"})
-        assert len(batches) > 1
-        rebuilt = ""
-        covered = 0
-        for batch in batches:
-            start, end = batch.source_start_column, batch.source_end_column
-            assert start is not None and end is not None and start <= covered
-            assert batch.start_line == batch.end_line == 1
-            assert batch.source_line_length == len(line)
-            rebuilt += batch.content[covered - start : end - start]
-            covered = end
-            analyzer._check_prompt_budget(analyzer.build_prompt(batch))
-        assert covered == len(line)
-        assert rebuilt.encode() == line.encode()
-        assert batches[-1].content.endswith("\n")
-
-
-# ---------------------------------------------------------------------------
 # LLMAnalyzerBase.collect_findings
 # ---------------------------------------------------------------------------
 
@@ -1251,18 +1036,6 @@ class TestRawStringMode:
         assert results[0][1] == ["chunk"]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_run_batches_uses_agent_cli_message_content(self) -> None:
-        analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
-        provider = MagicMock()
-        provider.complete.return_value = "raw CLI response"
-        analyzer._llm = AgentCLIChatModel(provider, self.MODEL, 1024)
-
-        results = analyzer.run_batches([Batch(file_path="a.py", content="code")])
-
-        assert results[0][1] == ["raw CLI response"]
-        provider.complete.assert_called_once()
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     async def test_arun_batches_uses_message_text_for_content_blocks(self) -> None:
         analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
         analyzer._llm.ainvoke = AsyncMock(
@@ -1272,18 +1045,6 @@ class TestRawStringMode:
         results = await analyzer.arun_batches([Batch(file_path="a.py", content="code")])
 
         assert results[0][1] == ["async chunk"]
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    async def test_arun_batches_uses_agent_cli_message_content(self) -> None:
-        analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
-        provider = MagicMock()
-        provider.complete.return_value = "async raw CLI response"
-        analyzer._llm = AgentCLIChatModel(provider, self.MODEL, 1024)
-
-        results = await analyzer.arun_batches([Batch(file_path="a.py", content="code")])
-
-        assert results[0][1] == ["async raw CLI response"]
-        provider.complete.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1304,31 +1065,6 @@ class TestRunBatches:
 
         assert chat_model.root_client.max_retries == API_CONNECTION_MAX_RETRIES
         assert chat_model.root_async_client.max_retries == API_CONNECTION_MAX_RETRIES
-
-    def test_sets_native_azure_openai_connection_retry_budget(self) -> None:
-        chat_model = AzureChatOpenAI(
-            azure_deployment="test-deployment",
-            api_version="2024-02-01",
-            api_key="sk-test",
-            azure_endpoint="https://provider.test",
-        )
-        assert chat_model.root_client is not None
-        assert chat_model.root_async_client is not None
-
-        with patch(MOCK_PATCH_TARGET, return_value=chat_model):
-            LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
-
-        assert chat_model.root_client.max_retries == API_CONNECTION_MAX_RETRIES
-        assert chat_model.root_async_client.max_retries == API_CONNECTION_MAX_RETRIES
-
-    def test_sets_native_anthropic_connection_retry_budget(self) -> None:
-        chat_model = ChatAnthropic(model="claude-sonnet-4-6", api_key="sk-test")
-        with patch(MOCK_PATCH_TARGET, return_value=chat_model):
-            LLMAnalyzerBase(base_prompt="test", model="claude-sonnet-4-6")
-
-        assert chat_model.max_retries == API_CONNECTION_MAX_RETRIES
-        assert chat_model._client.max_retries == API_CONNECTION_MAX_RETRIES
-        assert chat_model._async_client.max_retries == API_CONNECTION_MAX_RETRIES
 
     @patch(MOCK_PATCH_TARGET)
     @patch("skillspector.llm_analyzer_base.time.sleep")
@@ -1437,22 +1173,6 @@ class TestRunBatches:
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.time.sleep")
-    def test_cli_structured_parse_error_recovers_on_retry(self, sleep: MagicMock) -> None:
-        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
-        provider = MagicMock()
-        provider.complete.side_effect = ["not JSON", '{"findings": []}']
-        analyzer._llm = AgentCLIChatModel(provider, self.MODEL, 1024)
-        analyzer._structured_llm = analyzer._llm.with_structured_output(LLMAnalysisResult)
-
-        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
-
-        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
-        assert outcome.failures == []
-        assert provider.complete.call_count == 2
-        sleep.assert_called_once_with(0.5)
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    @patch("skillspector.llm_analyzer_base.time.sleep")
     def test_structured_validation_error_isolated_after_three_retries(
         self, sleep: MagicMock
     ) -> None:
@@ -1542,32 +1262,6 @@ class TestRunBatches:
         assert outcome.failures == []
         assert analyzer._structured_llm.invoke.call_count == 2
         sleep.assert_called_once_with(0.5)
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    @patch("skillspector.llm_analyzer_base.time.sleep")
-    def test_botocore_standard_transients_use_full_coordinator_budget(
-        self, sleep: MagicMock
-    ) -> None:
-        errors = [
-            HTTPClientError(error="connection reset"),
-            ResponseStreamingError(error="stream interrupted"),
-            _bedrock_error("RequestTimeout"),
-            _bedrock_error("RequestTimeoutException"),
-        ]
-
-        for error in errors:
-            analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
-            analyzer._structured_llm.invoke = MagicMock(side_effect=error)
-
-            outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
-
-            assert outcome.successful == []
-            assert [failure.reason for failure in outcome.failures] == [
-                LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-            ]
-            assert analyzer._structured_llm.invoke.call_count == API_CONNECTION_MAX_RETRIES + 1
-            assert sleep.call_args_list == [((0.5,), {}), ((1.0,), {}), ((2.0,), {})]
-            sleep.reset_mock()
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.time.sleep")
@@ -1790,7 +1484,7 @@ class TestDynamicTimeout:
                     ]
                 )
 
-        models: list[object] = [_LLM(), _LLM(), RefreshError("refresh failed")]
+        models: list[object] = [_LLM(), _LLM(), RuntimeError("client creation failed")]
 
         def _get_model(**_kwargs: object) -> _LLM:
             model = models.pop(0)
@@ -1812,7 +1506,7 @@ class TestDynamicTimeout:
         assert [batch.file_path for batch, _ in outcome.successful] == ["first.py"]
         assert outcome.successful[0][1][0].rule_id == "retained"
         assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
-            ("second.py", "RefreshError")
+            ("second.py", "RuntimeError")
         ]
         events, _ = ledger_events_for_batches("semantic_test", outcome)
         assert [(event["path"], event["outcome"]) for event in events] == [
@@ -1832,25 +1526,6 @@ class TestDynamicTimeout:
                 timeout=lambda: 10.0,
             )
 
-        assert chat_model.root_client.max_retries == 0
-        assert chat_model.root_async_client.max_retries == 0
-
-    def test_dynamic_deadline_disables_azure_openai_native_retries(self) -> None:
-        chat_model = AzureChatOpenAI(
-            azure_deployment="test-deployment",
-            api_version="2024-02-01",
-            api_key="sk-test",
-            azure_endpoint="https://provider.test",
-        )
-        with patch(MOCK_PATCH_TARGET, return_value=chat_model):
-            LLMAnalyzerBase(
-                base_prompt="test",
-                model="nvidia/openai/gpt-oss-120b",
-                timeout=lambda: 30.0,
-            )
-
-        assert chat_model.root_client is not None
-        assert chat_model.root_async_client is not None
         assert chat_model.root_client.max_retries == 0
         assert chat_model.root_async_client.max_retries == 0
 
@@ -1909,42 +1584,6 @@ class TestDynamicTimeout:
         assert async_client.timeout == 1.0
         assert sync_client.timeout == 1.0
         assert _cached_async_httpx_client.cache_info().misses == cache_misses_before
-
-    def test_gemini_reuses_client_until_adc_token_changes(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from skillspector.providers.gemini import GeminiProvider
-
-        provider = GeminiProvider()
-        tokens = iter(["first", "second", "second"])
-        monkeypatch.setattr(
-            provider,
-            "resolve_credentials",
-            lambda *, timeout: (next(tokens), "https://example.invalid"),
-        )
-        monkeypatch.setattr("skillspector.llm_analyzer_base.get_active_provider", lambda: provider)
-        built: list[ChatOpenAI] = []
-
-        def _factory(*, model: str, timeout: float | None = None) -> ChatOpenAI:
-            chat_model = ChatOpenAI(
-                model=model,
-                api_key="first" if not built else "second",
-                timeout=timeout,
-            )
-            built.append(chat_model)
-            return chat_model
-
-        monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", _factory)
-        analyzer = LLMAnalyzerBase(base_prompt="test", model="gemini-test", timeout=lambda: 10.0)
-
-        first, _ = analyzer._model_for_call()
-        second, _ = analyzer._model_for_call()
-        third, _ = analyzer._model_for_call()
-
-        assert first is built[0]
-        assert second is built[1]
-        assert third is second
-        assert len(built) == 2
 
     def test_run_batches_resolves_timeout_per_batch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Dynamic timeout providers are called again before every LLM call."""
@@ -2298,34 +1937,6 @@ class TestARunBatches:
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
-    async def test_botocore_standard_transients_use_full_coordinator_budget(
-        self, sleep: AsyncMock
-    ) -> None:
-        errors = [
-            HTTPClientError(error="connection reset"),
-            ResponseStreamingError(error="stream interrupted"),
-            _bedrock_error("RequestTimeout"),
-            _bedrock_error("RequestTimeoutException"),
-        ]
-
-        for error in errors:
-            analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
-            analyzer._structured_llm.ainvoke = AsyncMock(side_effect=error)
-
-            outcome = await analyzer.arun_batches_detailed(
-                [Batch(file_path="a.py", content="code")]
-            )
-
-            assert outcome.successful == []
-            assert [failure.reason for failure in outcome.failures] == [
-                LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-            ]
-            assert analyzer._structured_llm.ainvoke.call_count == API_CONNECTION_MAX_RETRIES + 1
-            assert sleep.await_args_list == [((0.5,), {}), ((1.0,), {}), ((2.0,), {})]
-            sleep.reset_mock()
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
     async def test_provider_no_retry_override_uses_generic_failure_ledger_reason(
         self, sleep: AsyncMock
     ) -> None:
@@ -2350,11 +1961,11 @@ class TestARunBatches:
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
-    async def test_bedrock_throttling_recovers_with_retry_after(self, sleep: AsyncMock) -> None:
+    async def test_http_throttling_recovers_with_retry_after(self, sleep: AsyncMock) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.ainvoke = AsyncMock(
             side_effect=[
-                _bedrock_error("ThrottlingException", retry_after="6"),
+                _status_error(429, retry_after="6"),
                 LLMAnalysisResult(findings=[]),
             ]
         )
@@ -3220,44 +2831,6 @@ class TestLLMMetaAnalyzerGetBatches:
         assert batches[0].findings == []
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_cli_batches_fit_with_large_metadata_and_findings(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
-        analyzer = LLMMetaAnalyzer(model=self.MODEL)
-        analyzer._input_budget = int(272_000 * 0.75)
-        content = "".join("m" * 40 + "\n" for _ in range(30_000))
-        findings = [self._make_finding("big.js", line=i) for i in range(1, 30_000, 100)]
-        metadata = "d" * 400_000
-        # Exercise the CLI byte cap with an explicit known local counting fixture;
-        # unknown codecs instead use the conservative byte-bound refusal test.
-        import tiktoken
-
-        codec = tiktoken.get_encoding("cl100k_base")
-        analyzer._token_counter = lambda text: len(codec.encode(text, disallowed_special=()))
-        batches = analyzer.get_batches(
-            ["big.js"], {"big.js": content}, findings, metadata_text=metadata
-        )
-        for batch in batches:
-            prompt = analyzer.build_prompt(batch, metadata_text=metadata)
-            assert len(prompt.encode("utf-8")) <= MAX_INPUT_BYTES
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_cli_sc10_redaction_cannot_push_prompt_over_limit(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
-        analyzer = LLMMetaAnalyzer(model=self.MODEL)
-        analyzer._input_budget = int(272_000 * 0.75)
-        # Each short credential URL grows when redact_text rewrites it.
-        content = "".join("x=http://u:p@h\n" for _ in range(70_000))
-        findings = [self._make_finding("creds.py", line=1, rule_id="SC10")]
-        batches = analyzer.get_batches(["creds.py"], {"creds.py": content}, findings)
-        assert all("u:p@" not in batch.content for batch in batches)
-        for batch in batches:
-            assert len(analyzer.build_prompt(batch).encode("utf-8")) <= MAX_INPUT_BYTES
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_sc10_redaction_keeps_lines_and_finding_aligned(self) -> None:
         analyzer = LLMMetaAnalyzer(model=self.MODEL)
         lines = [f"line {i}\n" for i in range(1, 11)]
@@ -3275,22 +2848,6 @@ class TestLLMMetaAnalyzerGetBatches:
         assert cache["creds.py"] == content  # the caller's cache is not mutated
         plain = next(b for b in batches if b.file_path == "plain.py")
         assert plain.content == "y=http://u:p@h\n"  # files without SC10 stay as they are
-
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_cli_fixed_prompt_over_cap_warns_and_keeps_content(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
-        analyzer = LLMMetaAnalyzer(model=self.MODEL)
-        content = "".join(f"line {i}\n" for i in range(1, 101))
-        findings = [self._make_finding("a.py", line=1)]
-        metadata = "d" * (MAX_INPUT_BYTES + 10)
-        with caplog.at_level("WARNING"):
-            batches = analyzer.get_batches(
-                ["a.py"], {"a.py": content}, findings, metadata_text=metadata
-            )
-        assert "".join(b.content for b in batches) == content
-        assert "exceeds the provider input limit" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -4643,22 +4200,6 @@ def test_plain_recovery_prioritizes_all_severities_before_optional_prose(monkeyp
     assert any(f.severity == "HIGH" for f in outcome.recovered[0][1])
     assert not any(field in {"explanation", "remediation"} for field, _ in requests)
     assert outcome.warnings and not outcome.failures
-
-
-@pytest.mark.parametrize("asynchronous", [False, True])
-def test_plain_recovery_cli_process_completion_remains_explicitly_unverified(
-    monkeypatch, asynchronous
-):
-    from skillspector.llm_utils import _AgentCLIMessage
-
-    analyzer, _ = _plain_recovery_analyzer(
-        monkeypatch,
-        lambda field, identity: _AgentCLIMessage(_recovery_answers(field, identity)),
-    )
-    outcome = _run_plain_recovery(analyzer, asynchronous)
-    assert not outcome.successful and not outcome.failures
-    assert outcome.recovered[0][1][0].severity == "HIGH"
-    assert outcome.warnings[0].reason == LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
 
 
 @pytest.mark.parametrize("stop", ["length", "content_filter", "pause_turn"])

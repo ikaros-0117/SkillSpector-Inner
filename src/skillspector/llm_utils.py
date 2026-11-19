@@ -13,38 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared LLM utilities (OpenAI-compatible chat models + agent CLI transports).
-
-Credentials are resolved in this order:
-    1. The active provider (see :mod:`skillspector.providers`):
-       - CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
-         ``opencode_cli``): use ``is_available()`` and ``complete()`` — no
-         API key needed.
-       - HTTP providers (``anthropic``, ``openai``, ``nv_build``): read their
-         respective credential env vars and supply a base URL.
-    2. ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` (the langchain-openai
-       defaults) — only consulted for HTTP providers when the provider's
-       own credential env var is unset.
-
-There is no SkillSpector-specific credential env var: setting
-``NVIDIA_INFERENCE_KEY`` configures whichever NVIDIA endpoint the
-deployment ships with, Anthropic reads ``ANTHROPIC_API_KEY``, and any
-other OpenAI-compatible endpoint is configured via the standard
-``OPENAI_*`` envs.
-"""
+"""Shared LLM utilities for OpenAI-compatible chat models."""
 
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import json
 import os
 import threading
 import weakref
 from collections.abc import Coroutine, Mapping
-from typing import Any, NoReturn
+from typing import Any
 
-from google.auth.exceptions import RefreshError
 from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
@@ -63,27 +43,20 @@ from skillspector.inference_usage import (
 from skillspector.llm_provenance import LLM_ANALYZER_SLOTS
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
-    UnknownProviderError,
     create_chat_model,
     create_chat_model_with_provider,
     get_active_provider,
     get_metadata_provider,
-    has_cli_capability,
     has_provider_binding,
     raise_no_llm_api_key_configured,
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
 from skillspector.providers.chat_models import UnsupportedControlError, resolve_reasoning_effort
-from skillspector.providers.gemini import GeminiProvider
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.structured_response import (
-    MAX_RESPONSE_CHARS,
     ResponseIssue,
-    parse_response_object,
     validate_message,
-    validate_payload,
-    validate_response_text,
 )
 from skillspector.structured_response import (
     StructuredOutputParseError as StructuredOutputParseError,
@@ -153,23 +126,7 @@ def _resolve_default_chat_model() -> str:
 
 
 def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
-    """Return ``(available, error_message)`` describing LLM availability.
-
-    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
-    ``opencode_cli``) are checked through their ``is_available()`` method
-    first. Other providers probe the same native chat-model path used by
-    :func:`get_chat_model`; unbound HTTP providers keep the
-    credential-resolution and OpenAI fallback path.  A configured model that
-    rejects a requested control makes the LLM unavailable, with the reason
-    from :func:`unsupported_control_error`.
-    """
-    try:
-        provider = get_active_provider()
-    except UnknownProviderError as exc:
-        return False, str(exc)
-    if has_cli_capability(provider):
-        return provider.is_available()  # type: ignore[attr-defined]
-
+    """Check whether credentials and controls are configured for the active provider."""
     try:
         if has_provider_binding():
             model = next(iter(_llm_slot_models()))
@@ -178,11 +135,9 @@ def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
                 max_tokens=get_max_output_tokens(model),
                 timeout=timeout,
             )
-        elif isinstance(provider, GeminiProvider):
-            provider.resolve_credentials(timeout=timeout)
         else:
             _resolve_llm_credentials()
-    except (ValueError, RefreshError, TimeoutError) as exc:
+    except (ValueError, TimeoutError) as exc:
         return False, str(exc)
     control_error = unsupported_control_error(timeout)
     return control_error is None, control_error
@@ -211,8 +166,6 @@ def unsupported_control_error(timeout: float | None = 120) -> str | None:
     ):
         return None
     try:
-        if has_cli_capability(get_active_provider()):
-            return None
         models = _llm_slot_models()
         for model in models:
             get_chat_model(model, timeout=timeout)
@@ -227,232 +180,6 @@ def unsupported_control_error(timeout: float | None = 120) -> str | None:
 def fetch_model_token_limits(model_label: str) -> tuple[int, int]:
     """Return ``(max_input_tokens, max_output_tokens)`` for *model_label*."""
     return get_max_input_tokens(model_label), get_max_output_tokens(model_label)
-
-
-# ---------------------------------------------------------------------------
-# Agent CLI chat-model adapter
-# ---------------------------------------------------------------------------
-#
-# The LLM analyzers (meta_analyzer, semantic_*) obtain a model from
-# ``get_chat_model()`` and call ``.invoke()`` / ``.with_structured_output(
-# schema).invoke()`` on it (see ``llm_analyzer_base``) — they never go through
-# ``chat_completion``. To support CLI providers there, ``get_chat_model``
-# returns this minimal adapter, which mimics the slice of the ``ChatOpenAI``
-# interface the analyzers rely on, backed by the provider's ``complete()``
-# subprocess transport.
-
-
-class _AgentCLIMessage:
-    """A response returned after the CLI provider's completion call succeeds."""
-
-    def __init__(self, content: str) -> None:
-        self.content = content
-        # CLI text transports expose process completion, not a model stop reason.
-        self.response_metadata = {"status": "completed", "completion_source": "cli_process"}
-
-
-def _extract_json_object(raw: str) -> dict:
-    """Extract a single JSON object from a CLI model's text response.
-
-    Tolerates markdown code fences and surrounding prose. Raises ``ValueError``
-    (fail-closed) when no JSON object can be parsed.
-    """
-    if len(raw) > MAX_RESPONSE_CHARS:
-        raise StructuredOutputParseError("response exceeds size limit", issue=ResponseIssue.LIMIT)
-    text = raw.strip()
-    if text.startswith("```"):
-        # Drop the opening fence line (``` or ```json) and any closing fence.
-        text = text.split("\n", 1)[1] if "\n" in text else ""
-        fence = text.rfind("```")
-        if fence != -1:
-            text = text[:fence]
-        text = text.strip()
-    try:
-        return parse_response_object(text)
-    except StructuredOutputParseError as exc:
-        if exc.issue != ResponseIssue.INVALID_JSON:
-            raise
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        try:
-            return parse_response_object(text[start : end + 1])
-        except StructuredOutputParseError as exc:
-            if exc.issue != ResponseIssue.INVALID_JSON:
-                raise
-    raise StructuredOutputParseError("could not extract a JSON object from CLI response")
-
-
-def _complete_agent_cli(
-    provider: object,
-    prompt: str,
-    *,
-    model: str,
-    max_output_tokens: int,
-    timeout: float | None,
-) -> str:
-    """Call a CLI provider without breaking the original extension protocol.
-
-    ``AgentCLICapable`` originally exposed no ``timeout`` keyword. Preserve
-    that call shape for ordinary scans, while forwarding an explicit deadline
-    to providers used by bounded scan paths. Legacy providers therefore keep
-    working for existing flows and fail closed if selected for a new flow that
-    requires deadline support.
-    """
-    if timeout is None:
-        return provider.complete(  # type: ignore[attr-defined,no-any-return]
-            prompt,
-            model=model,
-            max_output_tokens=max_output_tokens,
-        )
-    return provider.complete(  # type: ignore[attr-defined,no-any-return]
-        prompt,
-        model=model,
-        max_output_tokens=max_output_tokens,
-        timeout=timeout,
-    )
-
-
-def structured_output_instructions(schema: type) -> str:
-    """Text a CLI provider's structured call appends after the analyzer prompt.
-
-    Exposed so prompt budgeting can measure the exact bytes the transport adds.
-    """
-    schema_json = json.dumps(schema.model_json_schema(), indent=2)
-    return (
-        "\n\n"
-        "Respond with ONLY a single JSON object conforming to the JSON Schema "
-        "below. Do not wrap it in markdown code fences and do not add any prose "
-        f"before or after the JSON.\n\nJSON Schema:\n{schema_json}"
-    )
-
-
-class _StructuredAgentCLIModel:
-    """Mimics ``ChatOpenAI.with_structured_output(schema)`` for a CLI provider.
-
-    ``invoke`` augments the prompt with the schema, calls the provider's
-    ``complete()``, then parses and validates the response into *schema*.
-    """
-
-    def __init__(self, owner: AgentCLIChatModel, schema: type[BaseModel]) -> None:
-        # Read transport settings through the owner so a structured wrapper does not pin the
-        # deadline it happened to be created with.
-        self._owner = owner
-        self._schema = schema
-
-    def _augment(self, prompt: str) -> str:
-        return f"{prompt}{structured_output_instructions(self._schema)}"
-
-    def _complete(self, prompt: str) -> str:
-        """Return provider output before structured parsing begins."""
-        return _complete_agent_cli(
-            self._owner._provider,
-            self._augment(prompt),
-            model=self._owner._model,
-            max_output_tokens=self._owner._max_output_tokens,
-            timeout=self._owner._timeout,
-        )
-
-    def invoke(self, prompt: str) -> object:
-        raw = self._complete(prompt)
-        return self._parse(raw)
-
-    def _parse(self, raw: str) -> object:
-        try:
-            payload = _extract_json_object(raw)
-        except StructuredOutputParseError as exc:
-            if exc.issue in {
-                ResponseIssue.INVALID_JSON,
-                ResponseIssue.INVALID_SCHEMA,
-                ResponseIssue.EMPTY,
-            }:
-                try:
-                    validate_response_text(raw, self._schema, completed=True)
-                except StructuredOutputParseError as parse_error:
-                    if parse_error.issue == ResponseIssue.LIMIT:
-                        raise
-                    exc.recovery_text = parse_error.recovery_text
-            raise
-        try:
-            return validate_payload(payload, self._schema)
-        except StructuredOutputParseError as exc:
-            exc.recovery_text = raw.strip()
-            raise
-
-    async def ainvoke(self, prompt: str) -> object:
-        return await asyncio.to_thread(self.invoke, prompt)
-
-    def invoke_with_usage(
-        self,
-        prompt: str,
-        collector: InferenceUsageCollector,
-    ) -> object:
-        """Mark this invocation after transport success and before parsing."""
-        raw = self._complete(prompt)
-        collector.mark_response_received()
-        return self._parse(raw)
-
-    async def ainvoke_with_usage(
-        self,
-        prompt: str,
-        collector: InferenceUsageCollector,
-    ) -> object:
-        """Async counterpart to :meth:`invoke_with_usage`."""
-        return await asyncio.to_thread(self.invoke_with_usage, prompt, collector)
-
-
-class AgentCLIChatModel:
-    """Minimal ``ChatOpenAI``-compatible adapter backed by a CLI provider.
-
-    Implements only the surface the analyzers use: ``invoke`` (returns an
-    object with ``.content``), ``ainvoke``, and ``with_structured_output``.
-    The rest of the ``BaseChatModel`` surface (``batch``, ``stream``,
-    callbacks) is intentionally unsupported; the stubs below make that boundary
-    explicit so a future analyzer reaching for it fails loudly with a clear
-    message rather than a confusing ``AttributeError``.
-    """
-
-    def __init__(
-        self, provider: object, model: str, max_output_tokens: int, timeout: float | None = None
-    ) -> None:
-        self._provider = provider
-        self._model = model
-        self._max_output_tokens = max_output_tokens
-        self._timeout = timeout
-
-    def batch(self, *args: object, **kwargs: object) -> NoReturn:
-        raise NotImplementedError(
-            "AgentCLIChatModel supports only invoke/ainvoke/with_structured_output; "
-            "batch() is not available for CLI providers."
-        )
-
-    def stream(self, *args: object, **kwargs: object) -> NoReturn:
-        raise NotImplementedError(
-            "AgentCLIChatModel supports only invoke/ainvoke/with_structured_output; "
-            "stream() is not available for CLI providers."
-        )
-
-    def invoke(self, prompt: str) -> _AgentCLIMessage:
-        text = _complete_agent_cli(
-            self._provider,
-            prompt,
-            model=self._model,
-            max_output_tokens=self._max_output_tokens,
-            timeout=self._timeout,
-        )
-        return _AgentCLIMessage(text)
-
-    async def ainvoke(self, prompt: str) -> _AgentCLIMessage:
-        return await asyncio.to_thread(self.invoke, prompt)
-
-    def with_structured_output(
-        self, schema: type, method: str | None = None
-    ) -> _StructuredAgentCLIModel:
-        del method  # parity with LangChain chat models; the CLI transport always asks for JSON
-        return _StructuredAgentCLIModel(self, schema)
-
-    def set_timeout(self, timeout: float | None) -> None:
-        """Retarget this adapter, and its structured wrappers, at a new deadline."""
-        self._timeout = timeout
 
 
 STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
@@ -594,11 +321,8 @@ def bind_structured_output(
 ) -> object:
     """``llm.with_structured_output(schema)`` with the method *model* needs.
 
-    A chat model restricted to ``toolChoice`` ``auto`` (Bedrock models that
-    reject a forced tool call, or a ``ChatOpenAI`` with ``tool_choice``
-    disabled) and bound with a tool method gets the tool call asked for in
-    the prompt, and a prose answer raises :class:`StructuredOutputParseError`,
-    which the analyzers retry like any other malformed structured response.
+    When a model only accepts automatic tool choice, ask for the tool call
+    in the prompt and treat a prose answer as a structured-response error.
 
     ``force_method`` binds that method past the environment override and the
     provider hint. It exists only for the structured-output rejection
@@ -694,9 +418,7 @@ def bind_structured_output(
         return checked
     if unforced:
         return _require_tool_call(structured, schema, include_raw=include_raw)
-    if kwargs.get("method") == "function_calling" and not isinstance(
-        structured, _StructuredAgentCLIModel
-    ):
+    if kwargs.get("method") == "function_calling":
         return _validate_tool_call_result(structured, schema, include_raw=include_raw)
     return structured
 
@@ -743,12 +465,9 @@ def bind_structured_output_fallback(
 def _binds_unforced_tool_call(llm: object, method: str | None) -> bool:
     """``True`` when *method* binds the schema as a tool *llm* is not forced to call.
 
-    ``ChatBedrockConverse`` binds a tool by default; ``ChatOpenAI`` defaults to
-    ``json_schema``, so its ``tool_choice``-disabled form needs an explicit
-    ``function_calling``.
+    The OpenAI client defaults to JSON schema. Automatic tool choice applies
+    only when the schema is bound as a tool.
     """
-    if getattr(llm, "supports_tool_choice_values", None) == ("auto",):
-        return method in (None, "function_calling")
     disabled = getattr(llm, "disabled_params", None)
     return (
         method == "function_calling"
@@ -841,43 +560,8 @@ def _validate_tool_call_result(
     return RunnableLambda(_invoke, _ainvoke)
 
 
-def get_chat_model(
-    model: str | None = None, *, timeout: float | None = None
-) -> BaseChatModel | AgentCLIChatModel:
-    """Return a chat model for the active provider.
-
-    For CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
-    ``opencode_cli``) this returns an :class:`AgentCLIChatModel` adapter
-    backed by the provider's ``complete()`` subprocess transport — so the
-    LLM analyzers (which use ``.invoke()`` and ``.with_structured_output()``)
-    work with no API key.
-
-    For HTTP providers it delegates to
-    :func:`skillspector.providers.create_chat_model`, which uses the
-    provider's own native client (e.g. ``ChatAnthropic`` for Anthropic) with
-    an ``OPENAI_API_KEY`` / ``ChatOpenAI`` fallback.
-
-    Raises:
-        ValueError: when an HTTP provider has no API key configured.
-    """
-    provider = get_active_provider()
-    if has_cli_capability(provider):
-        # Every CLI call is a full agent session on the user's plan. Warn here,
-        # before the analyzers fan out; the scan path only probes availability
-        # from the report node, after the calls have run.
-        warn_session_cost = getattr(provider, "warn_session_cost", None)
-        if callable(warn_session_cost):
-            warn_session_cost()
-        resolved_model = model or provider.resolve_model()
-        chat_model = AgentCLIChatModel(
-            provider,
-            resolved_model,
-            get_max_output_tokens(resolved_model),
-            timeout,
-        )
-        register_chat_model_provider(chat_model, provider)
-        return chat_model
-
+def get_chat_model(model: str | None = None, *, timeout: float | None = None) -> BaseChatModel:
+    """Return the active provider's chat model, with standard OpenAI fallback."""
     model = model or _resolve_default_chat_model()
     chat_model, effective_provider = create_chat_model_with_provider(
         model=model,
@@ -889,18 +573,12 @@ def get_chat_model(
 
 
 def _invoke_with_usage(runnable: object, prompt: str, collector: InferenceUsageCollector) -> object:
-    """Invoke a LangChain runnable with telemetry without changing CLI adapters."""
+    """Invoke a LangChain runnable with response telemetry."""
     if isinstance(runnable, Runnable):
         return runnable.invoke(prompt, config={"callbacks": [collector]})
-    if isinstance(runnable, _StructuredAgentCLIModel):
-        return runnable.invoke_with_usage(prompt, collector)
     invoke_with_usage = getattr(type(runnable), "invoke_with_usage", None)
     if callable(invoke_with_usage):
         return invoke_with_usage(runnable, prompt, collector)
-    if isinstance(runnable, AgentCLIChatModel):
-        response = runnable.invoke(prompt)
-        collector.mark_response_received()
-        return response
     return runnable.invoke(prompt)  # type: ignore[attr-defined]
 
 
@@ -910,15 +588,9 @@ async def _ainvoke_with_usage(
     """Async counterpart to :func:`_invoke_with_usage`."""
     if isinstance(runnable, Runnable):
         return await runnable.ainvoke(prompt, config={"callbacks": [collector]})
-    if isinstance(runnable, _StructuredAgentCLIModel):
-        return await runnable.ainvoke_with_usage(prompt, collector)
     ainvoke_with_usage = getattr(type(runnable), "ainvoke_with_usage", None)
     if callable(ainvoke_with_usage):
         return await ainvoke_with_usage(runnable, prompt, collector)
-    if isinstance(runnable, AgentCLIChatModel):
-        response = await runnable.ainvoke(prompt)
-        collector.mark_response_received()
-        return response
     return await runnable.ainvoke(prompt)  # type: ignore[attr-defined]
 
 
@@ -948,15 +620,7 @@ def chat_completion(
     request_kind: str = "chat_completion",
     timeout: float | None = None,
 ) -> str:
-    """Request a single chat completion and return the assistant content.
-
-    Routes through :func:`get_chat_model`, which dispatches to the CLI adapter
-    for CLI providers and to the provider's native chat model for HTTP providers.
-
-    Uses ``.text`` when available (real LangChain ``BaseMessage`` objects,
-    which normalise content blocks to a single string) and falls back to
-    ``.content`` for the CLI adapter's ``_AgentCLIMessage``.
-    """
+    """Request a single chat completion and return the assistant content."""
     chat_model = get_chat_model(model=model, timeout=timeout)
     active_provider = get_active_provider()
     resolved_model = str(

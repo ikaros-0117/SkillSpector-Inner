@@ -27,7 +27,7 @@ Each successfully observed provider response contributes one entry to
       {
         "node": "semantic_security_discovery",
         "request_kind": "structured_output",
-        "provider": "nv_inference",
+        "provider": "openai_compatible",
         "model": "azure/anthropic/claude-opus-4-6",
         "model_source": "provider_response",
         "usage_source": "provider_response",
@@ -103,16 +103,8 @@ total tokens    = prompt_tokens + completion_tokens
 ```
 
 OpenAI-compatible responses generally report cache-read tokens as a partition
-already included in prompt tokens. Raw Anthropic responses report ordinary
-input, cache reads, and cache creation separately. SkillSpector adds the raw
-Anthropic cache partitions exactly once so `prompt_tokens` is inclusive for
-both response shapes.
-
-Anthropic cache-creation TTL details, when present, are combined into
-`cache_write_tokens`. SkillSpector does not currently send prompt-cache
-controls, so it does not choose between the separate 5-minute and 1-hour cache
-write tiers. Downstream pricing must not infer a TTL that the provider response
-did not preserve.
+already included in prompt tokens. Cache-write tokens appear when they are
+reported in the normalized response details.
 
 `reasoning_tokens` is a diagnostic partition and must not be added to
 `completion_tokens` a second time. Likewise, cache reads and cache writes must
@@ -122,8 +114,7 @@ not be added to `prompt_tokens` after normalization.
 
 `metadata.inference_usage` is always a list in JSON output. An empty list means
 usage was not observable. It does **not** mean that no LLM ran, that the request
-was free, or that the token count was zero. Typical causes include a provider or
-CLI transport that does not expose counters, an LLM call that failed before a
+was free, or that the token count was zero. Typical causes include an endpoint that does not expose counters, an LLM call that failed before a
 response, or a static-only scan.
 
 Cost observability and security-gate validity are separate decisions. A JSON

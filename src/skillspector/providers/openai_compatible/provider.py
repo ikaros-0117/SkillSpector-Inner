@@ -39,15 +39,13 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-
-from langchain_core.language_models.chat_models import BaseChatModel
+from typing import TYPE_CHECKING
 
 from skillspector.providers import registry
-from skillspector.providers.chat_models import (
-    create_openai_compatible_chat_model,
-    prepare_openai_chat_model_imports,
-)
 from skillspector.providers.structured_output import forced_tool_choice_supported
+
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -79,6 +77,8 @@ class OpenAICompatibleProvider:
 
     def prepare_chat_model_imports(self) -> None:
         """Prepare the OpenAI transport without resolving or creating a client."""
+        from skillspector.providers.chat_models import prepare_openai_chat_model_imports
+
         prepare_openai_chat_model_imports()
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
@@ -97,6 +97,8 @@ class OpenAICompatibleProvider:
         timeout: float | None = 120,
     ) -> BaseChatModel | None:
         """Create ``ChatOpenAI`` for the configured compatible endpoint."""
+        from skillspector.providers.chat_models import create_openai_compatible_chat_model
+
         return create_openai_compatible_chat_model(
             model=model,
             credentials=self.resolve_credentials(),

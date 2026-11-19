@@ -18,22 +18,13 @@ from skillspector.llm_provenance import (
 )
 from skillspector.llm_utils import new_inference_usage_collector
 from skillspector.providers.chat_models import create_openai_compatible_chat_model
-from skillspector.providers.nv_build import NvBuildProvider
 
 
 class OpenAIProvider:
     pass
 
 
-class AnthropicProvider:
-    pass
-
-
-class AzureOpenAIProvider:
-    pass
-
-
-class NvInferenceProvider:
+class OpenAICompatibleProvider:
     pass
 
 
@@ -59,7 +50,7 @@ def test_capture_records_resolved_adapters_models_and_forwarded_controls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "skillspector.llm_provenance.get_active_provider", lambda: AnthropicProvider()
+        "skillspector.llm_provenance.get_active_provider", lambda: OpenAICompatibleProvider()
     )
     monkeypatch.setattr(
         "skillspector.llm_provenance.get_model_config_provider", lambda: OpenAIProvider()
@@ -79,7 +70,7 @@ def test_capture_records_resolved_adapters_models_and_forwarded_controls(
     )
 
     assert result["provider"] == {
-        "configured_adapter": "anthropic",
+        "configured_adapter": "openai_compatible",
         "resolved_adapter": "openai",
         "effective_adapter": "openai",
         "effective_adapters": ["openai"],
@@ -164,38 +155,6 @@ def test_injected_build_revision_is_reported_separately_from_package_version(
     }
 
 
-def test_seed_is_requested_but_not_claimed_forwarded_for_anthropic(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "skillspector.llm_provenance.get_active_provider", lambda: AnthropicProvider()
-    )
-    monkeypatch.setattr(
-        "skillspector.llm_provenance.get_model_config_provider", lambda: AnthropicProvider()
-    )
-    monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.1")
-    monkeypatch.setenv("SKILLSPECTOR_SEED", "7")
-
-    result = sanitize_llm_provenance(
-        capture_llm_provenance(_models()),
-        use_llm=True,
-        inference_usage=_usage(
-            "anthropic",
-            {"temperature": 0.1, "reasoning_effort": None},
-        ),
-    )
-
-    assert result["sampling"]["temperature"]["forwarded_to_client"] == 0.1
-    assert result["sampling"]["seed"] == {
-        "requested": 7,
-        "source": "environment",
-        "forwarded_to_client": None,
-        "adapter_support": False,
-        "provider_support": "unknown",
-    }
-    assert result["determinism"]["control_status"] == "controls_partially_forwarded"
-
-
 def test_capture_is_stable_if_environment_changes_before_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -261,46 +220,6 @@ def test_constructor_observation_supersedes_stale_configuration_capture(
     assert result["sampling"]["seed"]["forwarded_to_client"] == 99
     assert result["sampling"]["reasoning_effort"]["requested"] == "high"
     assert result["sampling"]["reasoning_effort"]["forwarded_to_client"] == "high"
-
-
-@pytest.mark.parametrize("effort", [None, "   "])
-def test_nv_build_adapter_default_is_recorded_without_a_user_override(
-    monkeypatch: pytest.MonkeyPatch, effort: str | None
-) -> None:
-    provider = NvBuildProvider()
-    for name in ("SKILLSPECTOR_TEMPERATURE", "SKILLSPECTOR_SEED", "SKILLSPECTOR_REASONING_EFFORT"):
-        monkeypatch.delenv(name, raising=False)
-    if effort is not None:
-        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", effort)
-    monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-test")
-    monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: provider)
-    monkeypatch.setattr("skillspector.llm_provenance.get_model_config_provider", lambda: provider)
-    monkeypatch.setattr("skillspector.llm_utils.get_active_provider", lambda: provider)
-    model = provider.DEFAULT_MODEL
-    chat_model = provider.create_chat_model(model, max_tokens=128)
-    collector = new_inference_usage_collector(
-        node="semantic_security_discovery",
-        request_kind="structured_output",
-        model=model,
-        chat_model=chat_model,
-    )
-    collector.mark_response_received()
-
-    result = sanitize_llm_provenance(
-        capture_llm_provenance(_models(model)),
-        use_llm=True,
-        inference_usage=collector.snapshot(),
-    )
-
-    assert result["sampling"]["reasoning_effort"] == {
-        "requested": None,
-        "source": "provider_default",  # SkillSpector's adapter default.
-        "forwarded_to_client": "high",
-        "adapter_support": True,
-        "provider_support": "unknown",
-    }
-    assert result["determinism"]["control_status"] == "provider_defaults"
-    assert result["determinism"]["provider_guarantee"] is False
 
 
 def test_gpt_5_4_reports_only_controls_retained_by_request_payload(
@@ -486,11 +405,10 @@ def test_capture_and_projection_do_not_emit_credential_shaped_overrides(
     monkeypatch: pytest.MonkeyPatch,
     credential: str,
 ) -> None:
-    provider = AzureOpenAIProvider()
+    provider = OpenAICompatibleProvider()
     monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: provider)
     monkeypatch.setattr("skillspector.llm_provenance.get_model_config_provider", lambda: provider)
     monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", credential)
-    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", credential)
 
     result = sanitize_llm_provenance(
         capture_llm_provenance(_models(credential)),
@@ -536,11 +454,11 @@ def test_multiple_response_providers_are_reported_as_mixed() -> None:
     result = sanitize_llm_provenance(
         None,
         use_llm=True,
-        inference_usage=[*_usage("openai"), *_usage("anthropic")],
+        inference_usage=[*_usage("openai"), *_usage("openai_compatible")],
     )
 
     assert result["provider"]["effective_adapter"] == "mixed"
-    assert result["provider"]["effective_adapters"] == ["anthropic", "openai"]
+    assert result["provider"]["effective_adapters"] == ["openai", "openai_compatible"]
 
 
 def test_public_projection_repairs_inconsistent_control_shapes() -> None:
@@ -633,11 +551,13 @@ def test_invalid_and_unknown_controls_are_not_called_provider_defaults(
 def test_effective_provider_comes_from_response_not_preflight_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Bedrock-to-OpenAI fallback must report the provider that answered."""
-    bedrock_provider = type("BedrockProvider", (), {})()
-    monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: bedrock_provider)
+    """Report the OpenAI adapter that actually answered the call."""
+    compatible_provider = OpenAICompatibleProvider()
     monkeypatch.setattr(
-        "skillspector.llm_provenance.get_model_config_provider", lambda: bedrock_provider
+        "skillspector.llm_provenance.get_active_provider", lambda: compatible_provider
+    )
+    monkeypatch.setattr(
+        "skillspector.llm_provenance.get_model_config_provider", lambda: compatible_provider
     )
     monkeypatch.setenv("SKILLSPECTOR_SEED", "17")
 
@@ -650,17 +570,17 @@ def test_effective_provider_comes_from_response_not_preflight_candidate(
         ),
     )
 
-    assert result["provider"]["resolved_adapter"] == "bedrock"
+    assert result["provider"]["resolved_adapter"] == "openai_compatible"
     assert result["provider"]["effective_adapter"] == "openai"
     assert result["provider"]["effective_adapters"] == ["openai"]
     assert result["sampling"]["seed"]["adapter_support"] is True
     assert result["sampling"]["seed"]["forwarded_to_client"] == 17
 
 
-def test_nv_inference_preserves_all_observed_controls(
+def test_compatible_provider_preserves_all_observed_controls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = NvInferenceProvider()
+    provider = OpenAICompatibleProvider()
     monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: provider)
     monkeypatch.setattr("skillspector.llm_provenance.get_model_config_provider", lambda: provider)
     monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.25")
@@ -671,75 +591,21 @@ def test_nv_inference_preserves_all_observed_controls(
         capture_llm_provenance(_models()),
         use_llm=True,
         inference_usage=_usage(
-            "nv_inference",
+            "openai_compatible",
             {"temperature": 0.25, "seed": 23, "reasoning_effort": "high"},
         ),
     )
 
-    assert result["provider"]["effective_adapter"] == "nv_inference"
+    assert result["provider"]["effective_adapter"] == "openai_compatible"
     assert result["sampling"]["temperature"]["forwarded_to_client"] == 0.25
     assert result["sampling"]["seed"]["forwarded_to_client"] == 23
     assert result["sampling"]["reasoning_effort"]["forwarded_to_client"] == "high"
 
 
-def test_azure_routing_records_deployment_and_api_version(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "skillspector.llm_provenance.get_active_provider", lambda: AzureOpenAIProvider()
-    )
-    monkeypatch.setattr(
-        "skillspector.llm_provenance.get_model_config_provider", lambda: AzureOpenAIProvider()
-    )
-    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "production-v2")
-    monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "2025-01-01")
-
-    result = sanitize_llm_provenance(
-        capture_llm_provenance(_models("gpt-4o")),
-        use_llm=True,
-        inference_usage=_usage("azure_openai"),
-    )
-
-    assert result["analyzers"][0]["model"] == "gpt-4o"
-    assert result["provider"]["routing"] == {
-        "deployment_override": "production-v2",
-        "deployment_source": "environment",
-        "api_version": "2025-01-01",
-        "api_version_source": "environment",
-    }
-
-
-def test_azure_routing_uses_model_and_default_api_version_without_overrides(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "skillspector.llm_provenance.get_active_provider", lambda: AzureOpenAIProvider()
-    )
-    monkeypatch.setattr(
-        "skillspector.llm_provenance.get_model_config_provider", lambda: AzureOpenAIProvider()
-    )
-
-    result = sanitize_llm_provenance(
-        capture_llm_provenance(_models("gpt-4o")),
-        use_llm=True,
-        inference_usage=_usage("azure_openai"),
-    )
-
-    assert result["provider"]["routing"] == {
-        "deployment_override": None,
-        "deployment_source": "resolved_model",
-        "api_version": "2024-06-01",
-        "api_version_source": "provider_default",
-    }
-
-
 @pytest.mark.parametrize(
     ("class_name", "expected"),
     [
-        ("AzureOpenAIProvider", "azure_openai"),
-        ("OllamaProvider", "ollama"),
         ("OpenAICompatibleProvider", "openai_compatible"),
-        ("AntigravityCLIProvider", "antigravity_cli"),
     ],
 )
 def test_builtin_provider_names_are_canonical(class_name: str, expected: str) -> None:

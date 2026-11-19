@@ -231,23 +231,17 @@ def retained_chat_model_controls(
             payload = candidate
 
     if payload is not None:
-        output_config = payload.get("output_config")
-        output_config = output_config if isinstance(output_config, Mapping) else {}
         reasoning = payload.get("reasoning")
         reasoning = reasoning if isinstance(reasoning, Mapping) else {}
         for name in selected:
             if name == "reasoning_effort":
-                # Chat Completions, Responses, and Anthropic use different
-                # payload fields for the same control. Preserve explicit nulls.
-                controls[name] = payload.get(
-                    name, reasoning.get("effort", output_config.get("effort"))
-                )
+                # Chat Completions and Responses use different payload fields.
+                controls[name] = payload.get(name, reasoning.get("effort"))
             else:
                 controls[name] = payload.get(name)
     else:
         for name in selected:
-            attribute = "effort" if name == "reasoning_effort" else name
-            controls[name] = getattr(chat_model, name, getattr(chat_model, attribute, None))
+            controls[name] = getattr(chat_model, name, None)
     return _forwarded_controls(controls)
 
 
@@ -277,13 +271,6 @@ def _first_counter(*values: object) -> int | None:
         if parsed is not None:
             return parsed
     return None
-
-
-def _positive_counter_sum(*values: object) -> int | None:
-    """Return a positive sum when provider-specific partitions are present."""
-    counters = [parsed for value in values if (parsed := _counter(value)) is not None]
-    total = sum(counters)
-    return total if total > 0 else None
 
 
 def _label(value: object, fallback: str = "unknown") -> str:
@@ -319,22 +306,8 @@ def _model_label(value: object, fallback: str = "unknown") -> str:
 def provider_name(provider: object) -> str:
     """Return a stable provider label without endpoint or credential data."""
     names = {
-        "AntigravityCLIProvider": "antigravity_cli",
-        "AnthropicProvider": "anthropic",
-        "AnthropicProxyProvider": "anthropic_proxy",
-        "AzureOpenAIProvider": "azure_openai",
-        "BedrockProvider": "bedrock",
-        "ClaudeCLIProvider": "claude_cli",
-        "CodexCLIProvider": "codex_cli",
-        "GeminiCLIProvider": "gemini_cli",
-        "GeminiProvider": "gemini",
-        "MiniMaxProvider": "minimax",
-        "NvBuildProvider": "nv_build",
-        "NvInferenceProvider": "nv_inference",
-        "OllamaProvider": "ollama",
         "OpenAICompatibleProvider": "openai_compatible",
         "OpenAIProvider": "openai",
-        "OpencodeCLIProvider": "opencode_cli",
     }
     return names.get(type(provider).__name__, _label(type(provider).__name__.lower()))
 
@@ -368,67 +341,18 @@ def _usage_record(
         or token_usage.get("output_tokens_details")
     )
 
-    standardized_prompt = _first_counter(
-        usage_metadata.get("input_tokens"),
-        usage_metadata.get("prompt_tokens"),
-    )
-    # LangChain usage_metadata follows an inclusive input-token contract and
-    # carries cache partitions in input_token_details. Raw Anthropic usage is
-    # different: input_tokens excludes its separately reported cache fields.
-    # Use the raw-direct mode only when a standardized prompt total is absent.
-    # Some integrations populate unrelated usage metadata while leaving prompt
-    # accounting solely in the raw response.
-    direct_cache_read = (
-        _first_counter(
-            response_usage.get("cache_read_input_tokens"),
-            token_usage.get("cache_read_input_tokens"),
-        )
-        if standardized_prompt is None
-        else None
-    )
-    raw_cache_creation = _mapping(
-        response_usage.get("cache_creation") or token_usage.get("cache_creation")
-    )
-    raw_ttl_cache_write_tokens = _positive_counter_sum(
-        raw_cache_creation.get("ephemeral_5m_input_tokens"),
-        raw_cache_creation.get("ephemeral_1h_input_tokens"),
-    )
-    direct_cache_write = (
-        _first_counter(
-            raw_ttl_cache_write_tokens,
-            response_usage.get("cache_creation_input_tokens"),
-            token_usage.get("cache_creation_input_tokens"),
-            token_usage.get("cache_write_tokens"),
-        )
-        if standardized_prompt is None
-        else None
-    )
     cached_tokens = _first_counter(
-        direct_cache_read,
         input_details.get("cache_read"),
         input_details.get("cached_tokens"),
-        usage_metadata.get("cache_read_input_tokens"),
-        response_usage.get("cache_read_input_tokens"),
-        token_usage.get("cache_read_input_tokens"),
     )
-    detail_ttl_cache_write_tokens = _positive_counter_sum(
-        input_details.get("ephemeral_5m_input_tokens"),
-        input_details.get("ephemeral_1h_input_tokens"),
-    )
-    ttl_cache_write_tokens = detail_ttl_cache_write_tokens or raw_ttl_cache_write_tokens
     cache_write_tokens = _first_counter(
-        ttl_cache_write_tokens,
-        direct_cache_write,
         input_details.get("cache_creation"),
         input_details.get("cache_write"),
         input_details.get("cache_write_tokens"),
-        usage_metadata.get("cache_creation_input_tokens"),
-        response_usage.get("cache_creation_input_tokens"),
-        token_usage.get("cache_creation_input_tokens"),
-        token_usage.get("cache_write_tokens"),
     )
     prompt_tokens = _first_counter(
-        standardized_prompt,
+        usage_metadata.get("input_tokens"),
+        usage_metadata.get("prompt_tokens"),
         response_usage.get("input_tokens"),
         response_usage.get("prompt_tokens"),
         token_usage.get("prompt_tokens"),
@@ -442,12 +366,6 @@ def _usage_record(
         token_usage.get("completion_tokens"),
         token_usage.get("output_tokens"),
     )
-
-    # Anthropic's raw response reports cache reads and writes outside
-    # ``input_tokens``.  OpenAI-compatible nested cache counters are already a
-    # subset of prompt_tokens and therefore must not be added again.
-    if direct_cache_read is not None or direct_cache_write is not None:
-        prompt_tokens = (prompt_tokens or 0) + (direct_cache_read or 0) + (direct_cache_write or 0)
 
     reasoning_tokens = _first_counter(
         output_details.get("reasoning"),

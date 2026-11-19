@@ -25,10 +25,8 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 from langchain_core.runnables import Runnable, RunnableConfig
 
-from skillspector.inference_usage import sanitize_inference_usage
-from skillspector.inspection_ledger import LedgerReason, finalize_ledger
+from skillspector.inspection_ledger import finalize_ledger
 from skillspector.llm_analyzer_base import LLMAnalysisResult, LLMFinding
-from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.models import Finding
 from skillspector.nodes.analyzers.semantic_quality_policy import (
     ANALYZER_ID,
@@ -330,24 +328,6 @@ class TestErrorHandling:
             }
         )
         assert completeness["execution_successful"] is False
-
-    def test_post_response_value_error_without_usage_records_partial_coverage(self) -> None:
-        provider = MagicMock()
-        provider.complete.return_value = "not valid structured JSON"
-        cli_model = AgentCLIChatModel(provider, "gpt-5.6-sol", 1024)
-
-        with patch(MOCK_PATCH_TARGET, return_value=cli_model):
-            result = node({"file_cache": {"SKILL.md": "# Skill"}})
-
-        assert result["findings"] == []
-        assert result["inference_usage"][0]["usage_source"] == "provider_response"
-        assert sanitize_inference_usage(result["inference_usage"]) == []
-        assert result["inspection_ledger"]
-        assert result["inspection_ledger"][0]["outcome"] == "partial"
-        assert result["inspection_ledger"][0]["reason_code"] == (
-            LedgerReason.LLM_FORMAT_RECOVERY_EXHAUSTED
-        )
-        assert result["analyzer_status_events"][0]["status"] == "degraded"
 
 
 # ---------------------------------------------------------------------------

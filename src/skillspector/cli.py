@@ -695,42 +695,18 @@ def scan(
 
     Environment variables:
 
-        SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
-                               anthropic_proxy | bedrock | minimax | nv_build |
-                               nv_inference | ollama | azure_openai |
-                               openai_compatible | gemini | claude_cli |
-                               gemini_cli | opencode_cli. Defaults to the NVIDIA path
-                               (nv_inference, falling back to nv_build in
-                               OSS builds).
+        SKILLSPECTOR_PROVIDER  openai (default) | openai_compatible
         SKILLSPECTOR_MODEL     Override the active provider's default
                                model (applies to every analyzer slot).
         SKILLSPECTOR_LOG_LEVEL DEBUG | INFO | WARNING | ERROR (default WARNING).
 
-    Provider credentials (one of):
+    Provider credentials:
 
-        OPENAI_API_KEY [+ OPENAI_BASE_URL]   for SKILLSPECTOR_PROVIDER=openai
-        ANTHROPIC_API_KEY                    for SKILLSPECTOR_PROVIDER=anthropic
-        MINIMAX_API_KEY                      for SKILLSPECTOR_PROVIDER=minimax
-        ANTHROPIC_PROXY_API_KEY +
-          ANTHROPIC_PROXY_ENDPOINT_URL       for anthropic_proxy
-        AWS_PROFILE (optional) + AWS_REGION  for SKILLSPECTOR_PROVIDER=bedrock
-                                             (AWS_PROFILE: standard boto3 credential
-                                             chain when unset; AWS_REGION default: us-west-2)
-        NVIDIA_INFERENCE_KEY                 for the NVIDIA providers
-        AZURE_OPENAI_API_KEY +
-          AZURE_OPENAI_ENDPOINT              for azure_openai
+        OPENAI_API_KEY [+ OPENAI_BASE_URL]   for openai
         SKILLSPECTOR_COMPAT_API_KEY +
           SKILLSPECTOR_COMPAT_BASE_URL       for openai_compatible
         SKILLSPECTOR_COMPAT_HEADERS          optional JSON object of string headers
                                              for openai_compatible
-        GOOGLE_CLOUD_PROJECT [+ GOOGLE_CLOUD_LOCATION]
-                                             for gemini (uses Application
-                                             Default Credentials / Workload Identity)
-
-        ollama uses the local Ollama service. claude_cli,
-        gemini_cli, and opencode_cli use their CLI's existing local
-        authentication session. codex_cli is registered but disabled because
-        its read-only sandbox permits host-file reads; use another provider.
     """
     if max_skills is not None and (not recursive or mcp_registry or not Path(input_path).is_dir()):
         err_console.print(

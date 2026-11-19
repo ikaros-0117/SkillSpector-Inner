@@ -1791,7 +1791,7 @@ def test_json_report_exposes_only_sanitized_provider_usage(
             {
                 "node": "meta_analyzer",
                 "request_kind": "structured_output",
-                "provider": "anthropic",
+                "provider": "openai_compatible",
                 "model": "claude-sonnet-4-6",
                 "model_source": "provider_response",
                 "usage_source": "provider_response",
@@ -1809,7 +1809,7 @@ def test_json_report_exposes_only_sanitized_provider_usage(
         {
             "node": "meta_analyzer",
             "request_kind": "structured_output",
-            "provider": "anthropic",
+            "provider": "openai_compatible",
             "model": "claude-sonnet-4-6",
             "model_source": "provider_response",
             "usage_source": "provider_response",
@@ -1855,7 +1855,7 @@ def test_json_report_exposes_captured_llm_provenance(
         ],
         "llm_provenance": {
             "provider": {
-                "configured_adapter": "anthropic",
+                "configured_adapter": "openai_compatible",
                 "resolved_adapter": "openai",
                 "service": "private-service-name",
             },
@@ -1888,7 +1888,7 @@ def test_json_report_exposes_captured_llm_provenance(
     provenance = meta["llm_provenance"]
 
     assert provenance["provider"] == {
-        "configured_adapter": "anthropic",
+        "configured_adapter": "openai_compatible",
         "resolved_adapter": "openai",
         "effective_adapter": "openai",
         "effective_adapters": ["openai"],
@@ -1918,10 +1918,10 @@ def test_json_report_exposes_captured_llm_provenance(
     assert "must not leak" not in json.dumps(meta)
 
 
-def test_json_report_preserves_counterless_cli_provider_observation(
+def test_json_report_preserves_counterless_provider_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CLI success remains provenance evidence even without token counters."""
+    """A provider response remains provenance evidence even without token counters."""
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
@@ -1935,33 +1935,34 @@ def test_json_report_preserves_counterless_cli_provider_observation(
             {
                 "node": "semantic_developer_intent",
                 "request_kind": "structured_output",
-                "provider": "claude_cli",
+                "provider": "openai_compatible",
                 "model": "claude-sonnet-4-6",
                 "model_source": "requested_model",
                 "usage_source": "provider_response",
-                "forwarded_controls": {},
+                "requested_controls": dict.fromkeys(("temperature", "seed", "reasoning_effort")),
+                "forwarded_controls": dict.fromkeys(("temperature", "seed", "reasoning_effort")),
             }
         ],
         "llm_provenance": {
             "provider": {
-                "configured_adapter": "claude_cli",
-                "resolved_adapter": "claude_cli",
+                "configured_adapter": "openai_compatible",
+                "resolved_adapter": "openai_compatible",
             },
             "sampling": {
                 "temperature": {
                     "requested": None,
                     "source": "provider_default",
-                    "adapter_support": False,
+                    "adapter_support": True,
                 },
                 "seed": {
                     "requested": None,
                     "source": "unset",
-                    "adapter_support": False,
+                    "adapter_support": True,
                 },
                 "reasoning_effort": {
                     "requested": None,
                     "source": "provider_default",
-                    "adapter_support": False,
+                    "adapter_support": True,
                 },
             },
         },
@@ -1970,7 +1971,7 @@ def test_json_report_preserves_counterless_cli_provider_observation(
     meta = _meta_from_json_report(state)
 
     assert meta["inference_usage"] == []
-    assert meta["llm_provenance"]["provider"]["effective_adapter"] == "claude_cli"
+    assert meta["llm_provenance"]["provider"]["effective_adapter"] == "openai_compatible"
     assert meta["llm_provenance"]["determinism"]["classification"] == "nondeterministic"
     assert meta["llm_provenance"]["determinism"]["control_status"] == "provider_defaults"
 

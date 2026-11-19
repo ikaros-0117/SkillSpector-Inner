@@ -15,7 +15,7 @@
 
 """YAML model-registry utilities.
 
-Each provider ships an accompanying ``<provider>.yaml`` that lists the
+Each provider ships an accompanying ``model_registry.yaml`` that lists the
 token-budget metadata for the models it serves.  Providers call
 :func:`lookup_context_length` and :func:`lookup_max_output_tokens` with
 their bundled YAML path; results are cached per path for the lifetime of

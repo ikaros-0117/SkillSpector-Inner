@@ -21,7 +21,6 @@ def analyzer(monkeypatch: pytest.MonkeyPatch) -> lab.LLMAnalyzerBase:
     monkeypatch.setattr(lab, "_uses_native_connection_retries", lambda *args, **kwargs: False)
     monkeypatch.setattr(lab, "new_inference_usage_collector", lambda **kwargs: MagicMock())
     monkeypatch.setattr(lab.LLMAnalyzerBase, "_bind_structured_output", lambda *args: MagicMock())
-    monkeypatch.setattr(lab, "_cli_max_input_bytes", lambda: None)
     return lab.LLMAnalyzerBase("Review every supplied line.", "fixture")
 
 
@@ -42,15 +41,28 @@ def test_real_serialized_prompt_fits_and_keeps_every_line(
     source_lines = content.splitlines(keepends=True)
     covered: set[int] = set()
     for batch in batches:
-        prompt = analyzer.build_prompt(batch)
-        if analyzer.response_schema is not None:
-            prompt += lab.structured_output_instructions(analyzer.response_schema)
+        prompt = analyzer._serialized_input(analyzer.build_prompt(batch))
         assert len(prompt.encode("utf-8")) + lab.REQUEST_FRAMING_TOKENS <= analyzer._input_budget
         end = batch.end_line or len(source_lines)
         assert batch.content == "".join(source_lines[batch.start_line - 1 : end])
         covered.update(range(batch.start_line, end + 1))
     assert covered == set(range(1, len(source_lines) + 1))
     assert len(batches) < len(source_lines)
+
+
+def test_large_http_prompt_batches_fit_and_cover_every_line(
+    analyzer: lab.LLMAnalyzerBase,
+) -> None:
+    analyzer._input_budget = 204_000
+    line_count = 150_000
+    content = ("z" * 10 + "\n") * line_count
+    batches = analyzer.get_batches(["big.js"], {"big.js": content})
+    covered: set[int] = set()
+    for batch in batches:
+        analyzer._check_prompt_budget(analyzer.build_prompt(batch))
+        assert batch.end_line is not None
+        covered.update(range(batch.start_line, batch.end_line + 1))
+    assert covered == set(range(1, line_count + 1))
 
 
 def test_real_custom_findings_and_metadata_overhead_is_measured(
@@ -69,9 +81,7 @@ def test_real_custom_findings_and_metadata_overhead_is_measured(
     )
     batches = analyzer.get_batches(["source.js"], {"source.js": "line\n" * 4000}, [finding] * 100)
     for batch in batches:
-        prompt = analyzer.build_prompt(batch) + lab.structured_output_instructions(
-            analyzer.response_schema
-        )
+        prompt = analyzer._serialized_input(analyzer.build_prompt(batch))
         assert len(prompt.encode("utf-8")) + lab.REQUEST_FRAMING_TOKENS <= analyzer._input_budget
 
 

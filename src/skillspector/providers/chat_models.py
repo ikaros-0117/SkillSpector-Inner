@@ -24,7 +24,6 @@ from urllib.parse import urlparse
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.outputs import ChatResult
-from langchain_openai import AzureChatOpenAI as _AzureChatOpenAI
 from langchain_openai import ChatOpenAI as _ChatOpenAI
 from pydantic import BaseModel, SecretStr
 
@@ -63,10 +62,6 @@ class _RawToolArguments:
 
 class ChatOpenAI(_RawToolArguments, _ChatOpenAI):
     """OpenAI-compatible invoke/ainvoke preserving original tool response evidence."""
-
-
-class AzureChatOpenAI(_RawToolArguments, _AzureChatOpenAI):
-    """Native Azure invoke/ainvoke with the same tool response evidence."""
 
 
 def prepare_openai_chat_model_imports() -> None:
@@ -116,33 +111,25 @@ def resolve_seed() -> int | None:
 def resolve_sampling_parameters(
     model: str,
     *,
-    include_seed: bool = False,
     reasoning_effort: str | None = None,
-    registry_path: str | None = None,
-    native_anthropic: bool = False,
 ) -> dict[str, float | int]:
     """Resolve optional, validated sampling controls for a request to *model*.
 
     Raises :class:`UnsupportedControlError` when *model* rejects the requested
-    temperature or *reasoning_effort* (see :func:`reject_unsupported_controls`),
-    so every hosted provider applies the same guard before any request.
-    Only the official Anthropic endpoint sets *native_anthropic* to allow
-    Claude's backwards-compatible ``temperature=1.0``.
+    temperature or *reasoning_effort* (see :func:`reject_unsupported_controls`).
     """
     parameters: dict[str, float | int] = {}
     temperature = resolve_temperature()
     if temperature is not None:
         parameters["temperature"] = temperature
 
-    seed = resolve_seed() if include_seed else None
+    seed = resolve_seed()
     if seed is not None:
         parameters["seed"] = seed
     reject_unsupported_controls(
         model,
         parameters,
         reasoning_effort,
-        registry_path=registry_path,
-        native_anthropic=native_anthropic,
     )
     return parameters
 
@@ -151,28 +138,15 @@ def reject_unsupported_controls(
     model: str,
     sampling_parameters: dict[str, float | int],
     reasoning_effort: str | None = None,
-    *,
-    registry_path: str | None = None,
-    native_anthropic: bool = False,
 ) -> None:
     """Raise :class:`UnsupportedControlError` when *model* rejects a requested control.
 
     Any explicit ``temperature``, ``1.0`` included, fails for GPT-6.1 Sol, the
-    Claude models in ``SAMPLING_REJECTED_MODELS``, and registry entries at
-    *registry_path* declaring ``sampling: rejected``. The official Anthropic
-    endpoint accepts ``1.0`` for the known Claude models when
-    *native_anthropic* is set; other routes keep the strict guard.
+    and Claude models that reject temperature on OpenAI-compatible routes.
     GPT-6.1 Sol also accepts only ``GPT_6_1_SOL_REASONING_EFFORTS``.
     """
     sol = is_gpt_6_1_sol(model)
-    native_default_temperature = (
-        native_anthropic
-        and sampling_parameters.get("temperature") == 1.0
-        and rejects_sampling_controls(model)
-    )
-    if "temperature" in sampling_parameters and (
-        sol or (rejects_sampling_controls(model, registry_path) and not native_default_temperature)
-    ):
+    if "temperature" in sampling_parameters and (sol or rejects_sampling_controls(model)):
         raise UnsupportedControlError(
             f"SKILLSPECTOR_TEMPERATURE is not supported by {model}; unset it to use this model"
         )
@@ -218,8 +192,6 @@ def create_openai_compatible_chat_model(
     timeout: float | None = 120,
     default_headers: dict[str, str] | None = None,
     forced_tool_choice: bool = True,
-    default_reasoning_effort: str | None = None,
-    chat_model_class: type[ChatOpenAI] | None = None,
 ) -> BaseChatModel | None:
     """Create ``ChatOpenAI`` for providers serving OpenAI-compatible endpoints.
 
@@ -243,13 +215,11 @@ def create_openai_compatible_chat_model(
     if not forced_tool_choice:
         kwargs["disabled_params"] = {"tool_choice": None}
     reasoning_effort = resolve_reasoning_effort()
-    if reasoning_effort or default_reasoning_effort:
-        kwargs["reasoning_effort"] = reasoning_effort or default_reasoning_effort
-    sampling_parameters = resolve_sampling_parameters(
-        model, include_seed=True, reasoning_effort=reasoning_effort
-    )
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    sampling_parameters = resolve_sampling_parameters(model, reasoning_effort=reasoning_effort)
     kwargs.update(sampling_parameters)
-    chat_model = (chat_model_class or ChatOpenAI)(**kwargs)
+    chat_model = ChatOpenAI(**kwargs)
     register_chat_model_controls(
         chat_model,
         retained_chat_model_controls(

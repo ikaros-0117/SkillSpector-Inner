@@ -13,39 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pluggable LLM provider package.
+"""OpenAI and OpenAI-compatible LLM providers.
 
-The active provider supplies credentials, token-budget metadata, per-slot
-default model labels, and a native LangChain chat model. Each provider
-is its own subpackage with a ``provider.py`` and a bundled
-``model_registry.yaml``.
-
-Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
-
-    openai            → OpenAIProvider              (api.openai.com)
-    anthropic         → AnthropicProvider            (api.anthropic.com)
-    anthropic_proxy   → AnthropicProxyProvider       (Vertex-style raw-predict proxy)
-    bedrock           → BedrockProvider              (AWS Bedrock Runtime, SigV4)
-    minimax           → MiniMaxProvider              (global or China regional endpoint)
-    nv_build          → NvBuildProvider              (build.nvidia.com)
-    ollama            → OllamaProvider               (local Ollama instance)
-    azure_openai      → AzureOpenAIProvider          (Azure OpenAI Service)
-    openai_compatible → OpenAICompatibleProvider     (Groq, Together AI, Mistral, etc.)
-    gemini            → GeminiProvider               (Google Cloud ADC / Workload Identity)
-    claude_cli        → ClaudeCLIProvider            (local ``claude`` binary, no API key)
-    codex_cli         → CodexCLIProvider             (registered but disabled: host-file reads)
-    gemini_cli        → GeminiCLIProvider            (local ``gemini`` binary, no API key)
-    opencode_cli      → OpencodeCLIProvider          (local ``opencode`` binary, no API key)
-    antigravity_cli   → AntigravityCLIProvider       (local ``agy`` binary; registered
-                                                      but disabled; use gemini_cli)
-
-When unset, the selector defaults to ``nv_build``.
-
-CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``, ``opencode_cli``) implement the
-optional :class:`~skillspector.providers.base.AgentCLICapable` interface — they
-expose ``is_available()`` and ``complete()`` so that
-:func:`skillspector.llm_utils.get_chat_model` uses the local CLI subprocess
-instead of the ``ChatOpenAI`` HTTP transport.
+Select a provider with ``SKILLSPECTOR_PROVIDER``. The default is ``openai``.
 """
 
 from __future__ import annotations
@@ -55,22 +25,19 @@ from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, NoReturn
 
 from .base import (
-    AgentCLICapable,
     ChatModelProvider,
     CredentialsProvider,
     LLMProvider,
     ModelMetadataProvider,
-    has_cli_capability,
 )
 
 if TYPE_CHECKING:
     from langchain_core.language_models.chat_models import BaseChatModel
 
 NO_LLM_API_KEY_MESSAGE = (
-    "No LLM API key configured. Set the credential env var for the "
-    "active provider, or set OPENAI_API_KEY (and optionally "
-    "OPENAI_BASE_URL) to use a standard OpenAI-compatible endpoint. "
-    "For local models, try SKILLSPECTOR_PROVIDER=ollama. "
+    "No LLM API key configured. Set OPENAI_API_KEY (with optional OPENAI_BASE_URL), "
+    "or configure SKILLSPECTOR_COMPAT_API_KEY and SKILLSPECTOR_COMPAT_BASE_URL "
+    "for SKILLSPECTOR_PROVIDER=openai_compatible. "
     "Use --no-llm to skip LLM analysis and run static checks only."
 )
 
@@ -104,13 +71,6 @@ def has_provider_binding() -> bool:
     return _INJECTED_PROVIDER.get() is not None
 
 
-def _nv_build_provider() -> LLMProvider:
-    """Construct the default NVIDIA provider without importing it at package import time."""
-    from .nv_build import NvBuildProvider
-
-    return NvBuildProvider()
-
-
 def _select_active_provider() -> LLMProvider:
     """Construct the active provider based on ``SKILLSPECTOR_PROVIDER``."""
     injected_provider = _INJECTED_PROVIDER.get()
@@ -118,80 +78,16 @@ def _select_active_provider() -> LLMProvider:
         return injected_provider
 
     name = os.environ.get("SKILLSPECTOR_PROVIDER", "").strip().lower()
-
-    if name == "openai":
-        from .openai import OpenAIProvider
-
-        return OpenAIProvider()
-    if name == "anthropic":
-        from .anthropic import AnthropicProvider
-
-        return AnthropicProvider()
-    if name == "anthropic_proxy":
-        from .anthropic_proxy import AnthropicProxyProvider
-
-        return AnthropicProxyProvider()
-    if name == "bedrock":
-        from .bedrock import BedrockProvider
-
-        return BedrockProvider()
-    if name == "minimax":
-        from .minimax import MiniMaxProvider
-
-        return MiniMaxProvider()
-    if name == "ollama":
-        from .ollama import OllamaProvider
-
-        return OllamaProvider()
-    if name == "azure_openai":
-        from .azure_openai import AzureOpenAIProvider
-
-        return AzureOpenAIProvider()
+    if name in ("", "openai"):
+        return _openai_provider()
     if name == "openai_compatible":
         from .openai_compatible import OpenAICompatibleProvider
 
         return OpenAICompatibleProvider()
-    if name == "gemini":
-        from .gemini import GeminiProvider
-
-        return GeminiProvider()
-    if name == "nv_build":
-        return _nv_build_provider()
-    if name == "claude_cli":
-        from .claude_cli import ClaudeCLIProvider
-
-        return ClaudeCLIProvider()
-    if name == "codex_cli":
-        from .codex_cli import CodexCLIProvider
-
-        return CodexCLIProvider()
-    if name == "gemini_cli":
-        from .gemini_cli import GeminiCLIProvider
-
-        return GeminiCLIProvider()
-    if name == "opencode_cli":
-        from .opencode_cli import OpencodeCLIProvider
-
-        return OpencodeCLIProvider()
-    if name == "antigravity_cli":
-        from .antigravity_cli import AntigravityCLIProvider
-
-        return AntigravityCLIProvider()
-    if name in ("nv_inference", ""):
-        # Try the optional nv_inference subpackage if it's bundled with
-        # this installation; otherwise fall through to nv_build.
-        try:
-            from .nv_inference import NvInferenceProvider
-
-            return NvInferenceProvider()
-        except ImportError:
-            return _nv_build_provider()
 
     raise UnknownProviderError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
-        "Expected one of: openai, anthropic, anthropic_proxy, bedrock, minimax, nv_build, "
-        "ollama, azure_openai, openai_compatible, gemini, "
-        "claude_cli, codex_cli, gemini_cli, opencode_cli, antigravity_cli (or unset)."
+        "Expected one of: openai, openai_compatible (or unset)."
     )
 
 
@@ -201,27 +97,17 @@ def get_metadata_provider() -> ModelMetadataProvider:
 
 
 def get_active_provider() -> ModelMetadataProvider:
-    """Return the active provider (alias for :func:`get_metadata_provider`).
-
-    Preferred over :func:`get_metadata_provider` when callers also need to
-    check for optional capabilities (e.g. :func:`has_cli_capability`).
-    """
+    """Return the active provider (alias for :func:`get_metadata_provider`)."""
     return _select_active_provider()
 
 
 def resolve_provider_credentials() -> tuple[str, str | None] | None:
-    """Return ``(api_key, base_url)`` from the active provider.
-
-    Returns ``None`` when the provider's credential env var is unset, so
-    callers can fall through to other credential sources.  CLI providers
-    always return ``None`` from this method; availability is checked via
-    ``is_available()`` instead.
-    """
+    """Return the active provider's credentials when configured."""
     return _select_active_provider().resolve_credentials()
 
 
-def _openai_fallback_provider() -> LLMProvider:
-    """Return the standard OpenAI fallback provider."""
+def _openai_provider() -> LLMProvider:
+    """Construct the OpenAI provider without an eager package import."""
     from .openai import OpenAIProvider
 
     return OpenAIProvider()
@@ -236,26 +122,13 @@ def resolve_chat_model_credentials() -> tuple[str, str | None] | None:
     if has_provider_binding():
         return None
 
-    return _openai_fallback_provider().resolve_credentials()
+    return _openai_provider().resolve_credentials()
 
 
 def get_model_config_provider() -> LLMProvider:
-    """Return the provider whose model defaults match graph chat-model routing.
-
-    Explicit bindings, CLI providers, Bedrock's native AWS credential path,
-    and Gemini's ADC path remain authoritative. Unbound API-key providers use
-    OpenAI metadata only when their own credentials are absent and the OpenAI
-    fallback is configured.
-    """
+    """Return the provider whose model defaults match graph chat-model routing."""
     provider = _select_active_provider()
-    from .bedrock import BedrockProvider
-    from .gemini import GeminiProvider
-
-    if (
-        has_provider_binding()
-        or has_cli_capability(provider)
-        or isinstance(provider, (BedrockProvider, GeminiProvider))
-    ):
+    if has_provider_binding():
         return provider
     try:
         if provider.resolve_credentials() is not None:
@@ -263,7 +136,7 @@ def get_model_config_provider() -> LLMProvider:
     except ValueError:
         return provider
 
-    fallback = _openai_fallback_provider()
+    fallback = _openai_provider()
     if fallback.resolve_credentials() is not None:
         return fallback
     return provider
@@ -285,38 +158,21 @@ def create_chat_model_with_provider(
 ) -> tuple[BaseChatModel, LLMProvider]:
     """Create a chat model and return the provider that actually built it.
 
-    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
-    ``opencode_cli``) do not have a native LangChain chat model — callers
-    that need CLI transport should use
-    :func:`skillspector.llm_utils.get_chat_model` instead (which returns an
-    :class:`~skillspector.llm_utils.AgentCLIChatModel` adapter).
-
-    If the active provider is not configured, fall back to standard OpenAI
-    environment variables. This preserves the historical ``OPENAI_API_KEY``
-    escape hatch while letting configured providers choose their own client.
+    An unconfigured compatible provider falls back to standard OpenAI credentials.
+    An explicitly injected provider remains authoritative.
     """
     provider = _select_active_provider()
+    llm = provider.create_chat_model(model, max_tokens=max_tokens, timeout=timeout)
+    if llm is not None:
+        return llm, provider
 
-    # CLI providers don't participate in the create_chat_model path.
-    if not has_cli_capability(provider):
-        llm = provider.create_chat_model(model, max_tokens=max_tokens, timeout=timeout)
+    from .openai import OpenAIProvider
+
+    if not has_provider_binding() and not isinstance(provider, OpenAIProvider):
+        fallback = _openai_provider()
+        llm = fallback.create_chat_model(model, max_tokens=max_tokens, timeout=timeout)
         if llm is not None:
-            return llm, provider
-
-        if has_provider_binding():
-            raise_no_llm_api_key_configured()
-
-        from .openai import OpenAIProvider
-
-        if not isinstance(provider, OpenAIProvider):
-            fallback_provider = _openai_fallback_provider()
-            llm = fallback_provider.create_chat_model(
-                model,
-                max_tokens=max_tokens,
-                timeout=timeout,
-            )
-            if llm is not None:
-                return llm, fallback_provider
+            return llm, fallback
 
     raise_no_llm_api_key_configured()
 
@@ -337,7 +193,6 @@ def create_chat_model(
 
 
 __all__ = [
-    "AgentCLICapable",
     "ChatModelProvider",
     "CredentialsProvider",
     "LLMProvider",
@@ -350,7 +205,6 @@ __all__ = [
     "get_model_config_provider",
     "prepare_chat_model_imports",
     "get_metadata_provider",
-    "has_cli_capability",
     "has_provider_binding",
     "reset_provider",
     "raise_no_llm_api_key_configured",

@@ -1,27 +1,11 @@
-.PHONY: help install install-dev test test-unit test-provider openai anthropic nv_build gemini test-integration test-cov test-ci lint lint-fix format format-check clean build
+.PHONY: help install install-dev test test-unit test-provider openai test-integration test-cov test-ci lint lint-fix format format-check clean build
 
 # Prefer uv if available, else use pip (set when Makefile is parsed)
 UV := $(shell command -v uv 2>/dev/null)
 
-PROVIDER_TEST_SELECTION := $(filter openai anthropic nv_build gemini,$(MAKECMDGOALS))
-ifneq ($(PROVIDER_TEST_SELECTION),)
-PROVIDER_TEST_PROVIDERS := $(PROVIDER_TEST_SELECTION)
-PROVIDER_TEST_TARGETS :=
-ifneq ($(filter openai,$(PROVIDER_TEST_SELECTION)),)
-PROVIDER_TEST_TARGETS += tests/provider/test_provider_endpoint.py::test_openai_provider_makes_live_structured_request
-endif
-ifneq ($(filter anthropic,$(PROVIDER_TEST_SELECTION)),)
-PROVIDER_TEST_TARGETS += tests/provider/test_provider_endpoint.py::test_anthropic_provider_makes_live_structured_request
-endif
-ifneq ($(filter nv_build,$(PROVIDER_TEST_SELECTION)),)
-PROVIDER_TEST_TARGETS += tests/provider/test_provider_endpoint.py::test_nv_build_provider_makes_live_structured_request
-endif
-ifneq ($(filter gemini,$(PROVIDER_TEST_SELECTION)),)
-PROVIDER_TEST_TARGETS += tests/provider/test_provider_endpoint.py::test_gemini_provider_makes_live_structured_request
-endif
-else
-PROVIDER_TEST_PROVIDERS := openai anthropic nv_build gemini
 PROVIDER_TEST_TARGETS := tests/provider
+ifneq ($(filter openai,$(MAKECMDGOALS)),)
+PROVIDER_TEST_TARGETS := tests/provider/test_provider_endpoint.py::test_openai_provider_makes_live_structured_request
 endif
 
 # Default target. All targets assume the virtual env is already created and activated.
@@ -31,7 +15,7 @@ help:
 	@echo "  make install-dev    - Install with dev dependencies (uses uv if available, else pip)"
 	@echo "  make test           - Run unit + integration tests"
 	@echo "  make test-unit      - Run unit tests only (no LLM calls)"
-	@echo "  make test-provider [openai|anthropic|nv_build|gemini] - Run live provider tests"
+	@echo "  make test-provider [openai] - Run live provider tests or just the OpenAI endpoint check"
 	@echo "  make test-integration - Run integration tests only (invokes full graph, may call LLMs)"
 	@echo "  make test-cov       - Run tests with coverage report"
 	@echo "  make lint           - Run linters (ruff only)"
@@ -54,25 +38,16 @@ test: test-unit test-integration
 test-unit:
 	pytest -m "not integration and not provider" tests/
 
-# Run live provider tests (requires provider-specific API keys)
+# Run live provider tests and warn if the OpenAI key is missing
 test-provider:
 	@missing_keys=0; \
 	if [ -n "$${PROVIDER_TEST_MISSING_KEYS_FILE:-}" ]; then \
 		rm -f "$$PROVIDER_TEST_MISSING_KEYS_FILE"; \
 	fi; \
-	for provider in $(PROVIDER_TEST_PROVIDERS); do \
-		case "$$provider" in \
-			openai) env_name=OPENAI_API_KEY; label=OpenAI ;; \
-			anthropic) env_name=ANTHROPIC_API_KEY; label=Anthropic ;; \
-			nv_build) env_name=NVIDIA_INFERENCE_KEY; label="NV Build" ;; \
-			gemini) env_name=GOOGLE_CLOUD_PROJECT; label=Gemini ;; \
-		esac; \
-		eval "value=\$${$${env_name}:-}"; \
-		if [ -z "$$value" ]; then \
-			echo "WARNING: $$env_name is not set; $$label provider test will be skipped"; \
-			missing_keys=1; \
-		fi; \
-	done; \
+	if [ -z "$${OPENAI_API_KEY:-}" ]; then \
+		echo "WARNING: OPENAI_API_KEY is not set; the live OpenAI test will be skipped"; \
+		missing_keys=1; \
+	fi; \
 	pytest -m provider $(PROVIDER_TEST_TARGETS); \
 	pytest_status=$$?; \
 	if [ "$$pytest_status" -ne 0 ]; then \
@@ -82,7 +57,7 @@ test-provider:
 		printf "missing provider keys\n" > "$$PROVIDER_TEST_MISSING_KEYS_FILE"; \
 	fi
 
-openai anthropic nv_build gemini:
+openai:
 	@:
 
 # Run integration tests only (invokes full graph, may call LLMs)

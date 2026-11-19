@@ -901,10 +901,11 @@ def test_build_context_model_config_matches_openai_fallback(
     for key in (
         "SKILLSPECTOR_PROVIDER",
         "SKILLSPECTOR_MODEL",
-        "NVIDIA_INFERENCE_KEY",
-        "NVIDIA_INFERENCE_METADATA_KEY",
+        "SKILLSPECTOR_COMPAT_API_KEY",
+        "SKILLSPECTOR_COMPAT_BASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai_compatible")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
 
     result = build_context({"skill_path": str(tmp_path)})
